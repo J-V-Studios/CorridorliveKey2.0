@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Real-time CorridorKey for live streamers — GPU keying into OBS (Linux).
+"""Real-time CorridorKey for live streamers — GPU keying into OBS.
 
-Primary streamer UX (Linux):
+Works on **Windows and Linux**. Primary UX is a virtual camera via pyvirtualcam:
 
-  # one-time
-  sudo bash scripts/setup_obs_vcam_linux.sh
-
-  # every session — CUDA keying → /dev/video10 for OBS
+  pip install pyvirtualcam
   python live_stream.py --obs --source 0 --background plate.png
 
-Then in OBS: Sources → + → Video Capture Device (V4L2) → CorridorKey /dev/video10
+Then in OBS: Sources → + → Video Capture Device → select the virtual camera.
 
 Keying always runs on an NVIDIA CUDA GPU (no CPU-only primary path).
+Linux-only optional backend: --obs-backend v4l2 (ffmpeg→v4l2loopback).
 """
 
 from __future__ import annotations
@@ -27,18 +25,23 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 import torch
 
 from corridorkey.live import (
+    DEFAULT_OBS_BACKEND,
     DEFAULT_OBS_V4L2_DEVICE,
     LiveConfig,
     LiveKeySession,
     build_live_meta,
     find_obs_v4l2_device,
+    is_linux,
+    is_windows,
     list_v4l2_device_names,
     load_live_hint,
     obs_setup_instructions,
     open_capture,
     parse_capture_source,
+    pyvirtualcam_available,
     require_cuda_gpu,
     run_live_loop,
+    validate_obs_backend,
 )
 from corridorkey.runtime import RuntimePaths, load_model
 from corridorkey.video_io import none_path
@@ -58,8 +61,9 @@ def _parse_rgb(text: str) -> tuple[float, float, float]:
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=(
-            "CorridorKey v2 real-time GPU keying for live streamers. "
-            "Preferred OBS path on Linux: --obs (ffmpeg→v4l2loopback)."
+            "CorridorKey v2 real-time GPU keying for live streamers "
+            "(Windows + Linux). Preferred OBS path: --obs "
+            f"(default backend {DEFAULT_OBS_BACKEND})."
         ))
     ap.add_argument(
         "--source", default="0",
@@ -91,21 +95,23 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--obs", action="store_true",
         help=(
-            "Streamer mode: GPU-key and feed a Linux v4l2loopback device for OBS. "
-            "Defaults preview off; uses --v4l2-device (or auto /dev/video10)."
+            "Streamer mode: GPU-key and feed a virtual camera for OBS "
+            f"(default backend: {DEFAULT_OBS_BACKEND}, Windows+Linux). "
+            "Preview defaults off."
+        ))
+    ap.add_argument(
+        "--obs-backend", choices=("pyvirtualcam", "v4l2"),
+        default=DEFAULT_OBS_BACKEND,
+        help=(
+            "Virtual-camera backend. "
+            f"pyvirtualcam (default): Windows + Linux. "
+            "v4l2: Linux-only ffmpeg→v4l2loopback (no pyvirtualcam)."
         ))
     ap.add_argument(
         "--v4l2-device", default=None,
         help=(
-            f"v4l2loopback node for OBS (default with --obs: "
-            f"{DEFAULT_OBS_V4L2_DEVICE} or a device labeled CorridorKey)."
-        ))
-    ap.add_argument(
-        "--obs-backend", choices=("v4l2", "pyvirtualcam"), default="v4l2",
-        help=(
-            "How to write the OBS virtual camera. "
-            "v4l2 (default, recommended on Linux): ffmpeg→v4l2loopback. "
-            "pyvirtualcam: optional pip package."
+            "Linux only: v4l2loopback node for --obs-backend v4l2, or to pin "
+            f"pyvirtualcam's device (default {DEFAULT_OBS_V4L2_DEVICE})."
         ))
     ap.add_argument("--preview", action=argparse.BooleanOptionalAction, default=None,
                     help="OpenCV preview window (press q to quit). "
@@ -114,7 +120,8 @@ def build_argparser() -> argparse.ArgumentParser:
                     default="composite")
     ap.add_argument("--no-fps-overlay", action="store_true")
     ap.add_argument("--virtual-cam", action="store_true",
-                    help="Also/instead use pyvirtualcam (see --obs-backend).")
+                    help="Enable pyvirtualcam without --obs (same as --obs "
+                         "with preview still defaulting on).")
     ap.add_argument(
         "--ffmpeg-out", default=None,
         help="Optional extra sink: pipe composite to ffmpeg (file / RTMP / MPEG-TS).")
@@ -127,51 +134,69 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Nominal FPS for sinks/overlay (0 = use capture FPS).")
     ap.add_argument(
         "--check-obs", action="store_true",
-        help="Print CUDA + v4l2loopback status and OBS steps; do not run keying.")
+        help="Print CUDA + virtual-camera readiness and OBS steps; do not run keying.")
     return ap
 
 
 def _resolve_preview(args: argparse.Namespace) -> bool:
     if args.preview is not None:
         return bool(args.preview)
-    # --obs defaults to headless (OBS is the viewer).
     return not bool(args.obs)
 
 
-def _resolve_v4l2_device(args: argparse.Namespace) -> str | None:
+def _resolve_v4l2_device(args: argparse.Namespace, backend: str) -> str | None:
+    """Only resolve a v4l2 path when on Linux and needed."""
     if args.v4l2_device:
+        if not is_linux():
+            raise RuntimeError(
+                "--v4l2-device is Linux-only. On Windows use "
+                "--obs-backend pyvirtualcam without --v4l2-device.")
         return args.v4l2_device
-    if not args.obs:
+    if backend != "v4l2":
         return None
     found = find_obs_v4l2_device(None)
-    if found:
-        return found
-    return DEFAULT_OBS_V4L2_DEVICE
+    return found or DEFAULT_OBS_V4L2_DEVICE
 
 
 def run_check_obs() -> int:
-    """Doctor: CUDA + v4l2loopback readiness for the OBS path."""
+    """Doctor: CUDA + virtual-camera readiness (Windows + Linux)."""
     print("CorridorKey OBS readiness check")
     print("===============================")
+    print(f"  Platform: {sys.platform}")
     cuda_ok = torch.cuda.is_available()
-    print(f"  CUDA GPU: {'OK — ' + torch.cuda.get_device_name(0) if cuda_ok else 'MISSING'}")
-    if not cuda_ok:
-        print("  → Live keying will refuse to start (GPU required, no CPU fallback).")
-    devices = list_v4l2_device_names()
-    if devices:
-        print("  V4L2 devices:")
-        for dev, name in devices.items():
-            print(f"    {dev}: {name}")
+    if cuda_ok:
+        print(f"  CUDA GPU: OK — {torch.cuda.get_device_name(0)}")
     else:
-        print("  V4L2 devices: none visible under /sys/class/video4linux")
-    target = find_obs_v4l2_device(None) or DEFAULT_OBS_V4L2_DEVICE
-    exists = Path(target).exists()
-    print(f"  OBS target: {target} ({'present' if exists else 'MISSING'})")
-    if not exists:
-        print("  → Run: sudo bash scripts/setup_obs_vcam_linux.sh")
+        print("  CUDA GPU: MISSING")
+        print("  → Live keying will refuse to start (GPU required, no CPU fallback).")
+
+    pvc = pyvirtualcam_available()
+    print(f"  pyvirtualcam: {'OK' if pvc else 'MISSING (pip install pyvirtualcam)'}")
+
+    if is_linux():
+        devices = list_v4l2_device_names()
+        if devices:
+            print("  V4L2 devices:")
+            for dev, name in devices.items():
+                print(f"    {dev}: {name}")
+        else:
+            print("  V4L2 devices: none (needed for pyvirtualcam / --obs-backend v4l2)")
+        target = find_obs_v4l2_device(None) or DEFAULT_OBS_V4L2_DEVICE
+        exists = Path(target).exists()
+        print(f"  Linux loopback target: {target} ({'present' if exists else 'MISSING'})")
+        if not exists:
+            print("  → sudo bash scripts/setup_obs_vcam_linux.sh")
+        linux_ok = exists
+    else:
+        linux_ok = True  # not applicable
+        if is_windows():
+            print("  Windows virtual cam: provided by pyvirtualcam (no v4l2)")
+
     print()
-    print(obs_setup_instructions(target))
-    if not cuda_ok or not exists:
+    print(obs_setup_instructions(backend=DEFAULT_OBS_BACKEND))
+
+    ready = cuda_ok and pvc and linux_ok
+    if not ready:
         return 1
     print("Ready: python live_stream.py --obs --source 0 --background plate.png")
     return 0
@@ -183,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_check_obs()
 
     require_cuda_gpu("live streaming / OBS feed")
+    backend = validate_obs_backend(args.obs_backend)
 
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
@@ -199,17 +225,28 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     preview = _resolve_preview(args)
-    v4l2_device = _resolve_v4l2_device(args)
-    virtual_cam = bool(args.virtual_cam) and not v4l2_device
-
-    if args.obs or v4l2_device:
-        if v4l2_device and not Path(v4l2_device).exists():
-            print(obs_setup_instructions(v4l2_device), file=sys.stderr)
+    use_obs = bool(args.obs or args.virtual_cam)
+    v4l2_device = _resolve_v4l2_device(args, backend) if use_obs else (
+        args.v4l2_device if args.v4l2_device else None)
+    # pyvirtualcam path: virtual_cam flag; v4l2 path: device only.
+    virtual_cam = use_obs and backend == "pyvirtualcam"
+    if use_obs and backend == "v4l2":
+        virtual_cam = False
+        if not v4l2_device:
+            v4l2_device = DEFAULT_OBS_V4L2_DEVICE
+        if not Path(v4l2_device).exists():
+            print(obs_setup_instructions(backend=backend, v4l2_device=v4l2_device),
+                  file=sys.stderr)
             raise RuntimeError(
                 f"OBS v4l2 device {v4l2_device!r} missing. "
                 "Run: sudo bash scripts/setup_obs_vcam_linux.sh"
             )
-        print(obs_setup_instructions(v4l2_device or DEFAULT_OBS_V4L2_DEVICE))
+
+    if use_obs:
+        print(obs_setup_instructions(backend=backend, v4l2_device=v4l2_device))
+        if backend == "pyvirtualcam" and not pyvirtualcam_available():
+            raise RuntimeError(
+                "pip install pyvirtualcam  # required for --obs on Windows and Linux")
 
     print("Loading model for live path (CUDA: foundations + stage1 + stage2)...")
     model = load_model(paths, device="cuda")
@@ -230,12 +267,11 @@ def main(argv: list[str] | None = None) -> int:
     session = LiveKeySession(
         model, live_cfg, device="cuda", initial_hint=initial_hint)
     print(
-        f"Live ready (GPU): source={args.source!r}  capture={w}x{h}  "
-        f"model_grid={meta['shape_hw'][1]}x{meta['shape_hw'][0]}  "
-        f"obs={bool(args.obs)}  v4l2={v4l2_device!r}  "
-        f"backend={args.obs_backend}  preview={preview}")
+        f"Live ready (GPU): platform={sys.platform}  source={args.source!r}  "
+        f"capture={w}x{h}  model_grid={meta['shape_hw'][1]}x{meta['shape_hw'][0]}  "
+        f"obs={use_obs}  backend={backend}  v4l2={v4l2_device!r}  preview={preview}")
 
-    if not preview and not v4l2_device and not virtual_cam and not args.ffmpeg_out:
+    if not preview and not virtual_cam and not v4l2_device and not args.ffmpeg_out:
         print("warning: no sinks enabled; enabling preview so the loop is visible",
               file=sys.stderr)
         preview = True
@@ -247,8 +283,8 @@ def main(argv: list[str] | None = None) -> int:
         preview=preview,
         preview_mode=args.preview_mode,
         virtual_cam=virtual_cam,
-        v4l2_device=v4l2_device,
-        obs_backend=args.obs_backend,
+        v4l2_device=v4l2_device if (backend == "v4l2" or args.v4l2_device) else None,
+        obs_backend=backend,
         ffmpeg_out=args.ffmpeg_out,
         ffmpeg_bin=args.ffmpeg_bin,
         max_frames=args.max_frames,

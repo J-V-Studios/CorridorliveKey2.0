@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# One-time (or per-boot) Linux setup: v4l2loopback virtual camera for OBS.
+# Linux-only helper: load v4l2loopback for OBS / pyvirtualcam.
+#
+# Windows does not use this script — on Windows, `pip install pyvirtualcam`
+# provides the virtual camera for `python live_stream.py --obs`.
 #
 # Creates /dev/video10 labeled "CorridorKey" with exclusive_caps so OBS lists
-# it as a normal Video Capture Device (V4L2).
+# it as a normal Video Capture Device (V4L2). Used by:
+#   - default --obs (pyvirtualcam on Linux), and
+#   - optional --obs-backend v4l2
 #
 # Usage:
 #   sudo bash scripts/setup_obs_vcam_linux.sh

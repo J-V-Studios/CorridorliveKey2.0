@@ -90,90 +90,99 @@ writes:
 Native resolution is always preserved. The model reflect-pads internally to its
 required shape quantum and crops back to the original size for output.
 
-## Live Streaming (Real-Time) → OBS on Linux
+## Live Streaming (Real-Time) → OBS (Windows + Linux)
 
-Offline `infer.py` is built for clips: overlapping Hann windows, a full-clip
-RVM feature prepass, and ffmpeg file writers. For live streamers, use the
-**GPU-only** per-frame path and feed OBS a virtual camera.
+Offline `infer.py` is built for clips. For live streamers, use the **GPU-only**
+per-frame path and feed OBS a **virtual camera**.
 
-**Keying always requires an NVIDIA CUDA GPU** (same stack as offline inference).
-There is no CPU-only primary keying path — `live_stream.py` and
-`LiveKeySession` refuse to start without CUDA.
+**Keying always requires an NVIDIA CUDA GPU** on both Windows and Linux (same
+stack as offline inference). There is no CPU-only primary keying path —
+`live_stream.py` and `LiveKeySession` refuse to start without CUDA.
 
-### Recommended streamer UX (Linux): `--obs`
+### Recommended streamer UX: `--obs` + pyvirtualcam
 
-CorridorKey writes an already-keyed composite into a **v4l2loopback** device via
-ffmpeg. OBS ingests that device like a normal webcam. This avoids OBS chroma-key
-filters and does not need `pyvirtualcam` for the default path.
-
-#### 1. One-time Linux deps
+Same command on both OSes:
 
 ```
-# CorridorKey (same as Setup above)
-#   NVIDIA GPU + CUDA PyTorch, ffmpeg on PATH, weights via scripts/download_weights.py
-
-# Virtual camera kernel module
-sudo apt install v4l2loopback-dkms v4l2loopback-utils   # Debian/Ubuntu
-# Fedora: sudo dnf install v4l2loopback
-# Arch:   sudo pacman -S v4l2loopback-dkms
-
-sudo bash scripts/setup_obs_vcam_linux.sh
-# → /dev/video10 labeled "CorridorKey" (exclusive_caps=1)
+pip install pyvirtualcam
+python live_stream.py --obs --source 0 --background plate.png
 ```
 
-Check readiness anytime (no model load):
+CorridorKey keys/composites on the GPU, then publishes the result as a virtual
+webcam. OBS adds that device like any other camera — **do not** add an OBS
+Chroma Key filter.
+
+Check readiness (no model load):
 
 ```
 python live_stream.py --check-obs
 ```
 
-#### 2. Start the GPU keyer (program that feeds OBS)
+Useful knobs:
 
 ```
-python live_stream.py --obs --source 0 --background plate.png
-```
-
-Useful variants:
-
-```
-# Mirror webcam + half-res model for higher FPS (composite still at capture size)
 python live_stream.py --obs --source 0 --background plate.png --mirror --model-scale 0.5
-
-# Also show a local preview window
 python live_stream.py --obs --source 0 --background plate.png --preview
-
-# Explicit device / optional pyvirtualcam backend
-python live_stream.py --obs --v4l2-device /dev/video10 --obs-backend v4l2
-python live_stream.py --obs --obs-backend pyvirtualcam   # needs: pip install pyvirtualcam
 ```
 
-#### 3. Exact OBS Studio steps
+### Windows OBS setup
 
-1. Leave `live_stream.py --obs` running (it prints the device path on start).
-2. In OBS: **Sources → + → Video Capture Device (V4L2)**  
-   (some builds label this only “Video Capture Device”).
-3. **Device:** choose **CorridorKey** or `/dev/video10`.
-4. Resolution / FPS: match your camera, or leave Automatic.
-5. Right-click the source → **Transform → Fit to Screen** (optional).
-6. Set the OBS canvas to your stream size (e.g. 1920×1080).
-7. **Do not** add an OBS Chroma Key filter — CorridorKey already keyed on the GPU.
+1. Install CorridorKey deps (CUDA PyTorch, `ffmpeg` on PATH, weights via
+   `python scripts/download_weights.py`) and `pip install pyvirtualcam`.
+2. First virtual-cam run may install a driver — approve UAC if prompted.
+3. Start the keyer:
+   ```
+   python live_stream.py --obs --source 0 --background plate.png
+   ```
+4. In OBS: **Sources → + → Video Capture Device**.
+5. **Device:** select the virtual camera (often **OBS Virtual Camera**, or the
+   name printed by `live_stream`).
+6. Resolution/FPS: match your webcam, or Automatic.
+7. Optional: right-click source → **Transform → Fit to Screen**; set canvas to
+   1920×1080 (or your stream size).
+8. **Do not** add a Chroma Key / green-screen filter in OBS.
 
-If OBS shows a black frame: confirm `--obs` is still running, the device exists
-(`python live_stream.py --check-obs`), and no other app exclusively opened
-`/dev/video10`.
+### Linux OBS setup
+
+1. Same CorridorKey + CUDA setup as Windows, plus:
+   ```
+   pip install pyvirtualcam
+   sudo apt install v4l2loopback-dkms v4l2loopback-utils   # Debian/Ubuntu
+   # Fedora: sudo dnf install v4l2loopback
+   # Arch:   sudo pacman -S v4l2loopback-dkms
+   sudo bash scripts/setup_obs_vcam_linux.sh   # /dev/video10 "CorridorKey"
+   ```
+   (`v4l2loopback` is a **Linux-only** dependency; pyvirtualcam uses it under
+   the hood on Linux. Windows does not need it.)
+2. Start the keyer:
+   ```
+   python live_stream.py --obs --source 0 --background plate.png
+   ```
+3. In OBS: **Sources → + → Video Capture Device (V4L2)** (some builds omit
+   the “V4L2” suffix).
+4. **Device:** select **CorridorKey**, the pyvirtualcam node, or `/dev/video10`.
+5. Resolution/FPS: match your webcam, or Automatic; fit to screen as needed.
+6. **Do not** add a Chroma Key filter in OBS.
+
+#### Linux-only alternative (no pyvirtualcam)
+
+```
+python live_stream.py --obs --obs-backend v4l2 --v4l2-device /dev/video10
+```
+
+This writes frames with ffmpeg → v4l2loopback. It is **not** available on
+Windows (`--obs-backend v4l2` is platform-gated).
 
 ### Pipeline
 
 | Stage | How |
 |---|---|
-| Capture | `--source` webcam index (`0`), `/dev/video*`, file, or URL |
-| Key | `LiveKeySession.process_frame` on **CUDA** — foundations + Stage 1 + Stage 2, one frame at a time, RVM state + aux carry-hint |
-| Composite | FG over `--background` plate or `--background-rgb`, with `--despill-strength` |
-| Output (OBS) | `--obs` → ffmpeg → **v4l2loopback** (`/dev/video10` / CorridorKey) |
-| Other sinks | `--preview`, `--virtual-cam` / `--obs-backend pyvirtualcam`, `--ffmpeg-out` (file / RTMP) |
-
-Streamer-oriented defaults: single-frame Stage 1, carry-hint on, stages resident
-on GPU, solid dark background when no plate is set, `--obs` turns preview off.
+| Capture | `--source` webcam index (`0`), device path, file, or URL |
+| Key | `LiveKeySession.process_frame` on **CUDA** (Windows + Linux) |
+| Composite | FG over `--background` / `--background-rgb`, `--despill-strength` |
+| Output (OBS, default) | `--obs` → **pyvirtualcam** virtual webcam |
+| Output (Linux optional) | `--obs-backend v4l2` → ffmpeg → v4l2loopback |
+| Other sinks | `--preview`, `--ffmpeg-out` (file / RTMP) |
 
 Press `q` in a preview window to quit. Programmatic use:
 

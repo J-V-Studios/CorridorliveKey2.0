@@ -13,6 +13,7 @@ across frames for temporal continuity.
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -394,6 +395,8 @@ class LiveKeySession:
 
 DEFAULT_OBS_V4L2_DEVICE = "/dev/video10"
 OBS_V4L2_CARD_LABEL = "CorridorKey"
+# Cross-platform default: pyvirtualcam works on Windows + Linux (+ macOS).
+DEFAULT_OBS_BACKEND = "pyvirtualcam"
 
 
 def require_cuda_gpu(purpose: str = "live keying") -> None:
@@ -406,9 +409,19 @@ def require_cuda_gpu(purpose: str = "live keying") -> None:
         )
 
 
+def is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def is_windows() -> bool:
+    return sys.platform.startswith("win")
+
+
 def list_v4l2_device_names() -> dict[str, str]:
-    """Map ``/dev/videoN`` → card name from sysfs (Linux)."""
+    """Map ``/dev/videoN`` → card name from sysfs. Empty on non-Linux."""
     out: dict[str, str] = {}
+    if not is_linux():
+        return out
     sys_root = Path("/sys/class/video4linux")
     if not sys_root.is_dir():
         return out
@@ -427,7 +440,9 @@ def find_obs_v4l2_device(
     *,
     card_label: str = OBS_V4L2_CARD_LABEL,
 ) -> str | None:
-    """Pick a v4l2loopback device for OBS (prefer CorridorKey label)."""
+    """Pick a v4l2loopback device (Linux only). Returns None on Windows/macOS."""
+    if not is_linux() and preferred is None:
+        return None
     devices = list_v4l2_device_names()
     if preferred:
         if preferred in devices or Path(preferred).exists():
@@ -436,32 +451,89 @@ def find_obs_v4l2_device(
     for dev, name in devices.items():
         if card_label.lower() in name.lower() or "loopback" in name.lower():
             return dev
-    # Fall back to the conventional CorridorKey node even if not yet loaded,
-    # so callers can print setup instructions for that path.
     if Path(DEFAULT_OBS_V4L2_DEVICE).exists():
         return DEFAULT_OBS_V4L2_DEVICE
     return None
 
 
-def obs_setup_instructions(v4l2_device: str) -> str:
-    """Exact OBS Studio steps for ingesting the CorridorKey virtual camera."""
-    return f"""\
-OBS Studio setup (Linux — Video Capture Device / V4L2)
-======================================================
-1. Leave `live_stream.py --obs` running (GPU keying → {v4l2_device}).
-2. In OBS: Sources → + → Video Capture Device (V4L2)
-   (on some builds the label is just "Video Capture Device").
-3. Device: select "{OBS_V4L2_CARD_LABEL}" or {v4l2_device}.
-4. Resolution/FPS: match your capture (or leave Automatic).
-5. Deactivate any unused webcam sources that grab the same physical camera.
-6. Recommended: right-click the source → Transform → Fit to Screen;
-   set OBS canvas to your stream resolution (e.g. 1920x1080).
-7. Do NOT add a Chroma Key filter in OBS — CorridorKey already keyed on GPU.
+def pyvirtualcam_available() -> bool:
+    try:
+        import pyvirtualcam  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
-One-time Linux virtual-cam setup (if the device is missing):
-  sudo bash scripts/setup_obs_vcam_linux.sh
-  # creates {DEFAULT_OBS_V4L2_DEVICE} labeled "{OBS_V4L2_CARD_LABEL}"
+
+def obs_setup_instructions(
+    *,
+    backend: str = DEFAULT_OBS_BACKEND,
+    v4l2_device: str | None = None,
+    device_hint: str | None = None,
+) -> str:
+    """OBS Studio steps for Windows and Linux (virtual camera ingest)."""
+    device = device_hint or "(the virtual camera printed when live_stream starts)"
+    v4l2 = v4l2_device or DEFAULT_OBS_V4L2_DEVICE
+    common = """\
+Shared notes (Windows + Linux)
+------------------------------
+- Keying runs on an NVIDIA CUDA GPU only (no CPU-only primary path).
+- Leave `live_stream.py --obs` running while OBS is open.
+- In OBS: Sources → + → Video Capture Device
+  (Linux builds may say "Video Capture Device (V4L2)").
+- Do NOT add an OBS Chroma Key / green-screen filter — CorridorKey already
+  keyed and composited on the GPU.
+- Fit the source to the canvas; set OBS canvas to your stream size
+  (e.g. 1920x1080).
 """
+    windows = f"""\
+Windows OBS steps
+-----------------
+1. One-time: pip install pyvirtualcam
+   (first run may install a virtual-camera driver; approve UAC if prompted.)
+2. Start the keyer:
+     python live_stream.py --obs --source 0 --background plate.png
+3. In OBS: Sources → + → Video Capture Device
+4. Device: select the virtual camera (often "OBS Virtual Camera", or the
+   name printed by live_stream — currently: {device})
+5. Resolution/FPS: match your webcam, or Automatic.
+"""
+    linux = f"""\
+Linux OBS steps (default backend: pyvirtualcam)
+-----------------------------------------------
+1. One-time:
+     pip install pyvirtualcam
+     # pyvirtualcam on Linux needs a v4l2loopback device:
+     sudo apt install v4l2loopback-dkms v4l2loopback-utils   # Debian/Ubuntu
+     sudo bash scripts/setup_obs_vcam_linux.sh
+2. Start the keyer:
+     python live_stream.py --obs --source 0 --background plate.png
+3. In OBS: Sources → + → Video Capture Device (V4L2)
+4. Device: select the virtual camera / CorridorKey / {v4l2}
+5. Resolution/FPS: match your webcam, or Automatic.
+
+Linux-only alternative (no pyvirtualcam): ffmpeg → v4l2loopback
+  python live_stream.py --obs --obs-backend v4l2 --v4l2-device {v4l2}
+"""
+    backend_note = (
+        f"Active --obs-backend: {backend}\n"
+        f"(default on all OSes: {DEFAULT_OBS_BACKEND}; "
+        f"`v4l2` is Linux-only)\n"
+    )
+    return backend_note + "\n" + common + "\n" + windows + "\n" + linux
+
+
+def validate_obs_backend(backend: str) -> str:
+    """Normalize backend; gate Linux-only v4l2."""
+    backend = (backend or DEFAULT_OBS_BACKEND).strip().lower()
+    if backend not in ("pyvirtualcam", "v4l2"):
+        raise ValueError(
+            f"unsupported --obs-backend {backend!r}; "
+            "use 'pyvirtualcam' (Windows+Linux) or 'v4l2' (Linux only)")
+    if backend == "v4l2" and not is_linux():
+        raise RuntimeError(
+            "--obs-backend v4l2 is Linux-only. On Windows use the default "
+            "--obs-backend pyvirtualcam (pip install pyvirtualcam).")
+    return backend
 
 
 class FFmpegFrameSink:
@@ -514,11 +586,10 @@ class FFmpegFrameSink:
 
 
 class V4L2LoopbackSink:
-    """Linux OBS feed: raw BGR frames → ffmpeg → v4l2loopback device.
+    """Linux-only optional OBS feed: BGR frames → ffmpeg → v4l2loopback.
 
-    This is the preferred streamer UX on Linux: OBS adds a V4L2 Video Capture
-    Device pointing at the loopback node. No CPU keying — frames are already
-    GPU-composited; ffmpeg only repacks pixels into a V4L2 pixel format.
+    Prefer ``VirtualCamSink`` / ``--obs-backend pyvirtualcam`` on both Windows
+    and Linux. This backend is a Linux fallback that does not need pyvirtualcam.
     """
 
     def __init__(
@@ -531,6 +602,10 @@ class V4L2LoopbackSink:
         ffmpeg_bin: str = "ffmpeg",
         pix_fmt: str = "yuv420p",
     ):
+        if not is_linux():
+            raise RuntimeError(
+                "V4L2LoopbackSink is Linux-only. On Windows use "
+                "--obs-backend pyvirtualcam.")
         if not Path(device).exists():
             raise RuntimeError(
                 f"v4l2 device {device!r} not found. "
@@ -551,7 +626,11 @@ class V4L2LoopbackSink:
 
 
 class VirtualCamSink:
-    """pyvirtualcam output (Linux uses v4l2loopback under the hood)."""
+    """Cross-platform virtual camera via pyvirtualcam (Windows + Linux).
+
+    Windows: DirectShow virtual camera (driver may install on first use).
+    Linux: uses a v4l2loopback device under the hood (see setup script).
+    """
 
     def __init__(
         self,
@@ -565,9 +644,12 @@ class VirtualCamSink:
             import pyvirtualcam  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
-                "Virtual camera backend 'pyvirtualcam' is not installed. "
-                "On Linux prefer --obs (ffmpeg→v4l2loopback), or: "
-                "pip install pyvirtualcam"
+                "OBS virtual-camera backend requires pyvirtualcam.\n"
+                "  pip install pyvirtualcam\n"
+                "Linux also needs a v4l2loopback device "
+                "(sudo bash scripts/setup_obs_vcam_linux.sh).\n"
+                "Linux-only alternative without pyvirtualcam: "
+                "--obs-backend v4l2"
             ) from exc
         kwargs: dict[str, Any] = {
             "width": int(width),
@@ -575,12 +657,12 @@ class VirtualCamSink:
             "fps": float(fps),
             "fmt": pyvirtualcam.PixelFormat.BGR,
         }
-        if device:
+        # device= is Linux v4l2 path; ignore on Windows if unsupported.
+        if device and is_linux():
             kwargs["device"] = device
         try:
             self._cam = pyvirtualcam.Camera(**kwargs)
         except TypeError:
-            # Older pyvirtualcam without device= — open default loopback.
             kwargs.pop("device", None)
             self._cam = pyvirtualcam.Camera(**kwargs)
         self.device = getattr(self._cam, "device", device or "(pyvirtualcam)")
@@ -658,7 +740,7 @@ def run_live_loop(
     preview_mode: str = "composite",
     virtual_cam: bool = False,
     v4l2_device: str | None = None,
-    obs_backend: str = "v4l2",
+    obs_backend: str = DEFAULT_OBS_BACKEND,
     ffmpeg_out: str | None = None,
     ffmpeg_bin: str = "ffmpeg",
     ffmpeg_extra: list[str] | None = None,
@@ -668,9 +750,11 @@ def run_live_loop(
 ) -> LiveLoopStats:
     """Capture → GPU key → composite → sinks. Blocks until EOF / max_frames / 'q'.
 
-    OBS on Linux: set ``v4l2_device`` (preferred) or ``virtual_cam=True``.
+    OBS (Windows + Linux): ``virtual_cam=True`` with backend ``pyvirtualcam``.
+    Linux-only alternative: ``obs_backend='v4l2'`` + ``v4l2_device``.
     """
     require_cuda_gpu("live loop")
+    backend = validate_obs_backend(obs_backend) if (virtual_cam or v4l2_device) else obs_backend
     cap = open_capture(source)
     stats = LiveLoopStats()
     sink_ffmpeg: FFmpegFrameSink | None = None
@@ -694,17 +778,23 @@ def run_live_loop(
                 frame, background_bgr=background, fps=fps)
             stats.record(result["latency_ms"])
             out = result[out_key]
-            if v4l2_device or virtual_cam:
+            want_obs = virtual_cam or (v4l2_device is not None)
+            if want_obs:
                 if sink_v4l2 is None and sink_vcam is None:
-                    if v4l2_device and obs_backend != "pyvirtualcam":
+                    if backend == "v4l2":
+                        if not v4l2_device:
+                            raise RuntimeError(
+                                "--obs-backend v4l2 requires --v4l2-device "
+                                f"(e.g. {DEFAULT_OBS_V4L2_DEVICE})")
                         sink_v4l2 = V4L2LoopbackSink(
                             v4l2_device, w, h, fps, ffmpeg_bin=ffmpeg_bin)
-                        print(f"  OBS feed: writing composite → {v4l2_device} "
-                              f"(ffmpeg→v4l2loopback)", flush=True)
+                        print(f"  OBS feed (Linux v4l2): {v4l2_device}",
+                              flush=True)
                     else:
                         sink_vcam = VirtualCamSink(
-                            w, h, fps, device=v4l2_device)
-                        print(f"  OBS/virt-cam feed: {sink_vcam.device}",
+                            w, h, fps,
+                            device=v4l2_device if is_linux() else None)
+                        print(f"  OBS feed (pyvirtualcam): {sink_vcam.device}",
                               flush=True)
                 if sink_v4l2 is not None:
                     sink_v4l2.write(out)
