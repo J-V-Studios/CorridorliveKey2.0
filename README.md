@@ -90,48 +90,92 @@ writes:
 Native resolution is always preserved. The model reflect-pads internally to its
 required shape quantum and crops back to the original size for output.
 
-## Live Streaming (Real-Time)
+## Live Streaming (Real-Time) → OBS on Linux
 
 Offline `infer.py` is built for clips: overlapping Hann windows, a full-clip
 RVM feature prepass, and ffmpeg file writers. For live streamers, use the
-per-frame path instead:
+**GPU-only** per-frame path and feed OBS a virtual camera.
+
+**Keying always requires an NVIDIA CUDA GPU** (same stack as offline inference).
+There is no CPU-only primary keying path — `live_stream.py` and
+`LiveKeySession` refuse to start without CUDA.
+
+### Recommended streamer UX (Linux): `--obs`
+
+CorridorKey writes an already-keyed composite into a **v4l2loopback** device via
+ffmpeg. OBS ingests that device like a normal webcam. This avoids OBS chroma-key
+filters and does not need `pyvirtualcam` for the default path.
+
+#### 1. One-time Linux deps
 
 ```
-python live_stream.py --source 0 --background plate.png --preview
+# CorridorKey (same as Setup above)
+#   NVIDIA GPU + CUDA PyTorch, ffmpeg on PATH, weights via scripts/download_weights.py
+
+# Virtual camera kernel module
+sudo apt install v4l2loopback-dkms v4l2loopback-utils   # Debian/Ubuntu
+# Fedora: sudo dnf install v4l2loopback
+# Arch:   sudo pacman -S v4l2loopback-dkms
+
+sudo bash scripts/setup_obs_vcam_linux.sh
+# → /dev/video10 labeled "CorridorKey" (exclusive_caps=1)
 ```
 
-Integration points (capture → key → composite → output):
+Check readiness anytime (no model load):
+
+```
+python live_stream.py --check-obs
+```
+
+#### 2. Start the GPU keyer (program that feeds OBS)
+
+```
+python live_stream.py --obs --source 0 --background plate.png
+```
+
+Useful variants:
+
+```
+# Mirror webcam + half-res model for higher FPS (composite still at capture size)
+python live_stream.py --obs --source 0 --background plate.png --mirror --model-scale 0.5
+
+# Also show a local preview window
+python live_stream.py --obs --source 0 --background plate.png --preview
+
+# Explicit device / optional pyvirtualcam backend
+python live_stream.py --obs --v4l2-device /dev/video10 --obs-backend v4l2
+python live_stream.py --obs --obs-backend pyvirtualcam   # needs: pip install pyvirtualcam
+```
+
+#### 3. Exact OBS Studio steps
+
+1. Leave `live_stream.py --obs` running (it prints the device path on start).
+2. In OBS: **Sources → + → Video Capture Device (V4L2)**  
+   (some builds label this only “Video Capture Device”).
+3. **Device:** choose **CorridorKey** or `/dev/video10`.
+4. Resolution / FPS: match your camera, or leave Automatic.
+5. Right-click the source → **Transform → Fit to Screen** (optional).
+6. Set the OBS canvas to your stream size (e.g. 1920×1080).
+7. **Do not** add an OBS Chroma Key filter — CorridorKey already keyed on the GPU.
+
+If OBS shows a black frame: confirm `--obs` is still running, the device exists
+(`python live_stream.py --check-obs`), and no other app exclusively opened
+`/dev/video10`.
+
+### Pipeline
 
 | Stage | How |
 |---|---|
-| Capture | `--source` webcam index (`0`), device path, video file, or URL |
-| Key | `LiveKeySession.process_frame` — foundations + Stage 1 + Stage 2 on GPU, **one frame at a time**, with RVM state and optional aux carry-hint across frames |
-| Composite | FG over `--background` plate or `--background-rgb` solid color, with `--despill-strength` |
-| Output | OpenCV `--preview`, optional `--virtual-cam` (needs `pyvirtualcam`), and/or `--ffmpeg-out` (file / RTMP / MPEG-TS) |
+| Capture | `--source` webcam index (`0`), `/dev/video*`, file, or URL |
+| Key | `LiveKeySession.process_frame` on **CUDA** — foundations + Stage 1 + Stage 2, one frame at a time, RVM state + aux carry-hint |
+| Composite | FG over `--background` plate or `--background-rgb`, with `--despill-strength` |
+| Output (OBS) | `--obs` → ffmpeg → **v4l2loopback** (`/dev/video10` / CorridorKey) |
+| Other sinks | `--preview`, `--virtual-cam` / `--obs-backend pyvirtualcam`, `--ffmpeg-out` (file / RTMP) |
 
-Streamer-oriented defaults:
+Streamer-oriented defaults: single-frame Stage 1, carry-hint on, stages resident
+on GPU, solid dark background when no plate is set, `--obs` turns preview off.
 
-- Single-frame Stage 1 (lowest latency; equivalent spirit to offline `--hann_chunk 1 --hann_stride 1`)
-- Carry-hint on (previous aux matte guides subject identity)
-- Stages stay resident on GPU (no memmap prepass, no Stage 1/2 CPU swaps)
-- Solid dark background when no plate is provided
-
-Useful knobs:
-
-```
-# Faster preview on heavy resolutions (model runs at half scale; composite
-# is still returned at capture resolution)
-python live_stream.py --source 0 --model-scale 0.5 --mirror --preview
-
-# File dry-run without a camera, low-latency H.264 file sink
-python live_stream.py --source clip.mp4 --loop --no-preview \
-  --ffmpeg-out keyed.mp4 --max-frames 300
-
-# Virtual webcam for OBS / Zoom (pip install pyvirtualcam)
-python live_stream.py --source 0 --background office.png --virtual-cam --no-preview
-```
-
-Press `q` in the preview window to quit. Programmatic use:
+Press `q` in a preview window to quit. Programmatic use:
 
 ```python
 from corridorkey.live import LiveConfig, LiveKeySession
@@ -139,13 +183,12 @@ from corridorkey.runtime import RuntimePaths, load_model
 
 model = load_model(RuntimePaths.from_package("."), device="cuda")
 session = LiveKeySession(model, LiveConfig(mirror=True, model_scale=0.5))
-result = session.process_frame(frame_bgr)  # dict with composite_u8, alpha_u8, ...
+result = session.process_frame(frame_bgr)  # composite_u8 is what OBS should see
 ```
 
 Known limits versus offline clip mode: no multi-frame Hann blending (weaker
 long-range temporal consistency), peak VRAM holds all stages at once, and
-sustained FPS depends on resolution / GPU / `--model-scale`. The live path
-still requires an NVIDIA CUDA GPU and the same downloaded weights as `infer.py`.
+sustained FPS depends on resolution / GPU / `--model-scale`.
 
 ## Choosing An Inference Mode
 

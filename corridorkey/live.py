@@ -15,6 +15,7 @@ from __future__ import annotations
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterator
 
 import cv2
@@ -170,8 +171,11 @@ class LiveKeySession:
         device: str = "cuda",
         initial_hint: torch.Tensor | None = None,
     ):
-        if device.startswith("cuda") and not torch.cuda.is_available():
-            raise RuntimeError("LiveKeySession requires a CUDA GPU.")
+        require_cuda_gpu("LiveKeySession")
+        if not str(device).startswith("cuda"):
+            raise RuntimeError(
+                f"LiveKeySession device must be CUDA (got {device!r}); "
+                "CPU is not a supported primary keying path.")
         self.model = model
         self.cfg = cfg or LiveConfig()
         self.device = torch.device(device)
@@ -388,8 +392,80 @@ class LiveKeySession:
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_OBS_V4L2_DEVICE = "/dev/video10"
+OBS_V4L2_CARD_LABEL = "CorridorKey"
+
+
+def require_cuda_gpu(purpose: str = "live keying") -> None:
+    """Live / OBS path is GPU-only — refuse CPU as a primary path."""
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"CorridorKey {purpose} requires an NVIDIA CUDA GPU "
+            "(no CPU-only keying path). Install CUDA-enabled PyTorch and "
+            "use an RTX 30-series or newer GPU, same as offline infer.py."
+        )
+
+
+def list_v4l2_device_names() -> dict[str, str]:
+    """Map ``/dev/videoN`` → card name from sysfs (Linux)."""
+    out: dict[str, str] = {}
+    sys_root = Path("/sys/class/video4linux")
+    if not sys_root.is_dir():
+        return out
+    for entry in sorted(sys_root.iterdir()):
+        name_file = entry / "name"
+        if not name_file.is_file():
+            continue
+        card = name_file.read_text(encoding="utf-8", errors="replace").strip()
+        dev = f"/dev/{entry.name}"
+        out[dev] = card
+    return out
+
+
+def find_obs_v4l2_device(
+    preferred: str | None = None,
+    *,
+    card_label: str = OBS_V4L2_CARD_LABEL,
+) -> str | None:
+    """Pick a v4l2loopback device for OBS (prefer CorridorKey label)."""
+    devices = list_v4l2_device_names()
+    if preferred:
+        if preferred in devices or Path(preferred).exists():
+            return preferred
+        return None
+    for dev, name in devices.items():
+        if card_label.lower() in name.lower() or "loopback" in name.lower():
+            return dev
+    # Fall back to the conventional CorridorKey node even if not yet loaded,
+    # so callers can print setup instructions for that path.
+    if Path(DEFAULT_OBS_V4L2_DEVICE).exists():
+        return DEFAULT_OBS_V4L2_DEVICE
+    return None
+
+
+def obs_setup_instructions(v4l2_device: str) -> str:
+    """Exact OBS Studio steps for ingesting the CorridorKey virtual camera."""
+    return f"""\
+OBS Studio setup (Linux — Video Capture Device / V4L2)
+======================================================
+1. Leave `live_stream.py --obs` running (GPU keying → {v4l2_device}).
+2. In OBS: Sources → + → Video Capture Device (V4L2)
+   (on some builds the label is just "Video Capture Device").
+3. Device: select "{OBS_V4L2_CARD_LABEL}" or {v4l2_device}.
+4. Resolution/FPS: match your capture (or leave Automatic).
+5. Deactivate any unused webcam sources that grab the same physical camera.
+6. Recommended: right-click the source → Transform → Fit to Screen;
+   set OBS canvas to your stream resolution (e.g. 1920x1080).
+7. Do NOT add a Chroma Key filter in OBS — CorridorKey already keyed on GPU.
+
+One-time Linux virtual-cam setup (if the device is missing):
+  sudo bash scripts/setup_obs_vcam_linux.sh
+  # creates {DEFAULT_OBS_V4L2_DEVICE} labeled "{OBS_V4L2_CARD_LABEL}"
+"""
+
+
 class FFmpegFrameSink:
-    """Pipe BGR uint8 frames to ffmpeg (file, RTMP, MPEG-TS, etc.)."""
+    """Pipe BGR uint8 frames to ffmpeg (file, RTMP, MPEG-TS, v4l2, etc.)."""
 
     def __init__(
         self,
@@ -403,6 +479,7 @@ class FFmpegFrameSink:
     ):
         self.width = int(width)
         self.height = int(height)
+        self.output = output
         cmd = [
             ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -436,19 +513,77 @@ class FFmpegFrameSink:
         self.proc.wait(timeout=30)
 
 
-class VirtualCamSink:
-    """Optional pyvirtualcam output (OBS / Zoom virtual webcam)."""
+class V4L2LoopbackSink:
+    """Linux OBS feed: raw BGR frames → ffmpeg → v4l2loopback device.
 
-    def __init__(self, width: int, height: int, fps: float):
+    This is the preferred streamer UX on Linux: OBS adds a V4L2 Video Capture
+    Device pointing at the loopback node. No CPU keying — frames are already
+    GPU-composited; ffmpeg only repacks pixels into a V4L2 pixel format.
+    """
+
+    def __init__(
+        self,
+        device: str,
+        width: int,
+        height: int,
+        fps: float,
+        *,
+        ffmpeg_bin: str = "ffmpeg",
+        pix_fmt: str = "yuv420p",
+    ):
+        if not Path(device).exists():
+            raise RuntimeError(
+                f"v4l2 device {device!r} not found. "
+                "Run: sudo bash scripts/setup_obs_vcam_linux.sh"
+            )
+        # Uncompressed V4L2 output — low latency for OBS ingest.
+        extra = ["-f", "v4l2", "-pix_fmt", pix_fmt]
+        self.device = device
+        self._sink = FFmpegFrameSink(
+            device, width, height, fps,
+            ffmpeg_bin=ffmpeg_bin, extra_args=extra)
+
+    def write(self, frame_bgr: np.ndarray) -> None:
+        self._sink.write(frame_bgr)
+
+    def close(self) -> None:
+        self._sink.close()
+
+
+class VirtualCamSink:
+    """pyvirtualcam output (Linux uses v4l2loopback under the hood)."""
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        fps: float,
+        *,
+        device: str | None = None,
+    ):
         try:
             import pyvirtualcam  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
-                "Virtual camera output requires pyvirtualcam. "
-                "Install with: pip install pyvirtualcam"
+                "Virtual camera backend 'pyvirtualcam' is not installed. "
+                "On Linux prefer --obs (ffmpeg→v4l2loopback), or: "
+                "pip install pyvirtualcam"
             ) from exc
-        self._cam = pyvirtualcam.Camera(
-            width=int(width), height=int(height), fps=float(fps), fmt=pyvirtualcam.PixelFormat.BGR)
+        kwargs: dict[str, Any] = {
+            "width": int(width),
+            "height": int(height),
+            "fps": float(fps),
+            "fmt": pyvirtualcam.PixelFormat.BGR,
+        }
+        if device:
+            kwargs["device"] = device
+        try:
+            self._cam = pyvirtualcam.Camera(**kwargs)
+        except TypeError:
+            # Older pyvirtualcam without device= — open default loopback.
+            kwargs.pop("device", None)
+            self._cam = pyvirtualcam.Camera(**kwargs)
+        self.device = getattr(self._cam, "device", device or "(pyvirtualcam)")
 
     def write(self, frame_bgr: np.ndarray) -> None:
         if frame_bgr.shape[1] != self._cam.width or frame_bgr.shape[0] != self._cam.height:
@@ -522,6 +657,8 @@ def run_live_loop(
     preview: bool = True,
     preview_mode: str = "composite",
     virtual_cam: bool = False,
+    v4l2_device: str | None = None,
+    obs_backend: str = "v4l2",
     ffmpeg_out: str | None = None,
     ffmpeg_bin: str = "ffmpeg",
     ffmpeg_extra: list[str] | None = None,
@@ -529,10 +666,15 @@ def run_live_loop(
     loop_file: bool = False,
     show_fps: bool = True,
 ) -> LiveLoopStats:
-    """Capture → key → composite → sinks. Blocks until EOF / max_frames / 'q'."""
+    """Capture → GPU key → composite → sinks. Blocks until EOF / max_frames / 'q'.
+
+    OBS on Linux: set ``v4l2_device`` (preferred) or ``virtual_cam=True``.
+    """
+    require_cuda_gpu("live loop")
     cap = open_capture(source)
     stats = LiveLoopStats()
     sink_ffmpeg: FFmpegFrameSink | None = None
+    sink_v4l2: V4L2LoopbackSink | None = None
     sink_vcam: VirtualCamSink | None = None
     background: np.ndarray | None = None
     window = "CorridorKey Live"
@@ -552,10 +694,23 @@ def run_live_loop(
                 frame, background_bgr=background, fps=fps)
             stats.record(result["latency_ms"])
             out = result[out_key]
-            if virtual_cam:
-                if sink_vcam is None:
-                    sink_vcam = VirtualCamSink(w, h, fps)
-                sink_vcam.write(out)
+            if v4l2_device or virtual_cam:
+                if sink_v4l2 is None and sink_vcam is None:
+                    if v4l2_device and obs_backend != "pyvirtualcam":
+                        sink_v4l2 = V4L2LoopbackSink(
+                            v4l2_device, w, h, fps, ffmpeg_bin=ffmpeg_bin)
+                        print(f"  OBS feed: writing composite → {v4l2_device} "
+                              f"(ffmpeg→v4l2loopback)", flush=True)
+                    else:
+                        sink_vcam = VirtualCamSink(
+                            w, h, fps, device=v4l2_device)
+                        print(f"  OBS/virt-cam feed: {sink_vcam.device}",
+                              flush=True)
+                if sink_v4l2 is not None:
+                    sink_v4l2.write(out)
+                else:
+                    assert sink_vcam is not None
+                    sink_vcam.write(out)
             if ffmpeg_out:
                 if sink_ffmpeg is None:
                     sink_ffmpeg = FFmpegFrameSink(
@@ -579,6 +734,8 @@ def run_live_loop(
         cap.release()
         if sink_ffmpeg is not None:
             sink_ffmpeg.close()
+        if sink_v4l2 is not None:
+            sink_v4l2.close()
         if sink_vcam is not None:
             sink_vcam.close()
         if preview:

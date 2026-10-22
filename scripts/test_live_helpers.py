@@ -18,14 +18,24 @@ def main() -> int:
     sys.path.insert(0, str(root))
 
     from corridorkey.live import (
+        DEFAULT_OBS_V4L2_DEVICE,
         LiveConfig,
         LiveLoopStats,
         _preview_key,
         build_live_meta,
+        find_obs_v4l2_device,
+        list_v4l2_device_names,
         load_background_bgr,
+        obs_setup_instructions,
         parse_capture_source,
+        require_cuda_gpu,
     )
-    from live_stream import build_argparser, _parse_rgb
+    from live_stream import (
+        _parse_rgb,
+        _resolve_preview,
+        _resolve_v4l2_device,
+        build_argparser,
+    )
 
     # --- parse helpers ---
     assert parse_capture_source("0") == 0
@@ -59,7 +69,7 @@ def main() -> int:
     # green sRGB → BGR: B=0, G=255, R=0
     assert int(bg[0, 0, 1]) == 255
 
-    # --- stats + CLI wiring ---
+    # --- stats + config ---
     stats = LiveLoopStats()
     stats.record(10.0)
     stats.record(20.0)
@@ -72,22 +82,69 @@ def main() -> int:
     assert cfg.low_vram is False
     assert cfg.model_scale == 1.0
 
+    # --- OBS helpers (safe without a real loopback) ---
+    assert DEFAULT_OBS_V4L2_DEVICE == "/dev/video10"
+    assert isinstance(list_v4l2_device_names(), dict)
+    # preferred missing path → None
+    assert find_obs_v4l2_device("/dev/corridorkey_missing_device_xyz") is None
+    text = obs_setup_instructions(DEFAULT_OBS_V4L2_DEVICE)
+    assert "Video Capture Device" in text
+    assert DEFAULT_OBS_V4L2_DEVICE in text
+    assert "Chroma Key" in text
+
+    # GPU is required — on this CI/dev box without CUDA we expect refusal.
+    try:
+        require_cuda_gpu("test")
+        # If CUDA is present, that is also fine.
+        cuda_required_ok = True
+    except RuntimeError as exc:
+        assert "CUDA" in str(exc)
+        cuda_required_ok = True
+    assert cuda_required_ok
+
+    # --- CLI: --obs defaults ---
     ns = build_argparser().parse_args([
+        "--source", "1",
+        "--obs",
+        "--background", "plate.png",
+        "--model-scale", "0.5",
+        "--mirror",
+    ])
+    assert ns.obs is True
+    assert ns.obs_backend == "v4l2"
+    assert _resolve_preview(ns) is False  # --obs ⇒ preview off by default
+    assert _resolve_v4l2_device(ns) in (
+        DEFAULT_OBS_V4L2_DEVICE,
+        find_obs_v4l2_device(None) or DEFAULT_OBS_V4L2_DEVICE,
+    )
+
+    ns2 = build_argparser().parse_args([
+        "--obs", "--preview", "--v4l2-device", "/dev/video12",
+    ])
+    assert _resolve_preview(ns2) is True
+    assert _resolve_v4l2_device(ns2) == "/dev/video12"
+
+    ns3 = build_argparser().parse_args([
         "--source", "1",
         "--no-preview",
         "--ffmpeg-out", "out.mp4",
-        "--model-scale", "0.5",
-        "--mirror",
-        "--loop",
         "--max-frames", "10",
+        "--loop",
     ])
-    assert ns.source == "1"
-    assert ns.preview is False
-    assert ns.ffmpeg_out == "out.mp4"
-    assert ns.model_scale == 0.5
-    assert ns.mirror is True
-    assert ns.loop is True
-    assert ns.max_frames == 10
+    assert ns3.preview is False
+    assert ns3.ffmpeg_out == "out.mp4"
+    assert ns3.max_frames == 10
+    assert ns3.loop is True
+
+    ns4 = build_argparser().parse_args(["--check-obs"])
+    assert ns4.check_obs is True
+
+    setup = root / "scripts" / "setup_obs_vcam_linux.sh"
+    assert setup.is_file()
+    body = setup.read_text(encoding="utf-8")
+    assert "v4l2loopback" in body
+    assert "CorridorKey" in body
+    assert "exclusive_caps=1" in body
 
     print("live helpers ok")
     return 0
