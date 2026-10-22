@@ -90,6 +90,63 @@ writes:
 Native resolution is always preserved. The model reflect-pads internally to its
 required shape quantum and crops back to the original size for output.
 
+## Live Streaming (Real-Time)
+
+Offline `infer.py` is built for clips: overlapping Hann windows, a full-clip
+RVM feature prepass, and ffmpeg file writers. For live streamers, use the
+per-frame path instead:
+
+```
+python live_stream.py --source 0 --background plate.png --preview
+```
+
+Integration points (capture → key → composite → output):
+
+| Stage | How |
+|---|---|
+| Capture | `--source` webcam index (`0`), device path, video file, or URL |
+| Key | `LiveKeySession.process_frame` — foundations + Stage 1 + Stage 2 on GPU, **one frame at a time**, with RVM state and optional aux carry-hint across frames |
+| Composite | FG over `--background` plate or `--background-rgb` solid color, with `--despill-strength` |
+| Output | OpenCV `--preview`, optional `--virtual-cam` (needs `pyvirtualcam`), and/or `--ffmpeg-out` (file / RTMP / MPEG-TS) |
+
+Streamer-oriented defaults:
+
+- Single-frame Stage 1 (lowest latency; equivalent spirit to offline `--hann_chunk 1 --hann_stride 1`)
+- Carry-hint on (previous aux matte guides subject identity)
+- Stages stay resident on GPU (no memmap prepass, no Stage 1/2 CPU swaps)
+- Solid dark background when no plate is provided
+
+Useful knobs:
+
+```
+# Faster preview on heavy resolutions (model runs at half scale; composite
+# is still returned at capture resolution)
+python live_stream.py --source 0 --model-scale 0.5 --mirror --preview
+
+# File dry-run without a camera, low-latency H.264 file sink
+python live_stream.py --source clip.mp4 --loop --no-preview \
+  --ffmpeg-out keyed.mp4 --max-frames 300
+
+# Virtual webcam for OBS / Zoom (pip install pyvirtualcam)
+python live_stream.py --source 0 --background office.png --virtual-cam --no-preview
+```
+
+Press `q` in the preview window to quit. Programmatic use:
+
+```python
+from corridorkey.live import LiveConfig, LiveKeySession
+from corridorkey.runtime import RuntimePaths, load_model
+
+model = load_model(RuntimePaths.from_package("."), device="cuda")
+session = LiveKeySession(model, LiveConfig(mirror=True, model_scale=0.5))
+result = session.process_frame(frame_bgr)  # dict with composite_u8, alpha_u8, ...
+```
+
+Known limits versus offline clip mode: no multi-frame Hann blending (weaker
+long-range temporal consistency), peak VRAM holds all stages at once, and
+sustained FPS depends on resolution / GPU / `--model-scale`. The live path
+still requires an NVIDIA CUDA GPU and the same downloaded weights as `infer.py`.
+
 ## Choosing An Inference Mode
 
 CorridorKey can run with no hints, a single first-frame hint, or a full hint
