@@ -15,6 +15,10 @@ weights/**
 vfms/**
 !vfms/**/
 !vfms/**/*.gitkeep
+demo_assets/**
+!demo_assets/**/
+!demo_assets/**/.gitkeep
+!demo_assets/**/README.md
 *.tar.zst
 *.tar
 *.zst

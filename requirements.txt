@@ -9,6 +9,6 @@ scipy>=1.16
 pillow>=11
 tqdm>=4.67
 utils3d @ git+https://github.com/EasternJournalist/utils3d.git@83bfa5bda008803f6521ce9547f94023b8afeddd
-# Optional — live OBS virtual camera (Windows + Linux):
-#   pip install pyvirtualcam
+# Optional — live OBS + desktop capture (Windows + Linux):
+#   pip install pyvirtualcam mss
 # Linux also needs v4l2loopback (see scripts/setup_obs_vcam_linux.sh).

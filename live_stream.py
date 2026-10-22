@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Real-time CorridorKey for live streamers — GPU keying into OBS.
 
-Works on **Windows and Linux**. Primary UX is a virtual camera via pyvirtualcam:
+Windows + Linux. Capture from webcam, file, **desktop/monitor**, or ``--demo``.
 
-  pip install pyvirtualcam
+Examples::
+
+  # Webcam → OBS virtual camera
   python live_stream.py --obs --source 0 --background plate.png
 
-Then in OBS: Sources → + → Video Capture Device → select the virtual camera.
+  # Desktop greenscreen: green windows become transparent in OBS
+  python live_stream.py --desktop --obs --transparent --preview
 
-Keying always runs on an NVIDIA CUDA GPU (no CPU-only primary path).
-Linux-only optional backend: --obs-backend v4l2 (ffmpeg→v4l2loopback).
+  # Webcam-free sample loop (CUDA still required)
+  python live_stream.py --demo --preview
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import torch
 
+from corridorkey.desktop_capture import parse_desktop_source
 from corridorkey.live import (
     DEFAULT_OBS_BACKEND,
     DEFAULT_OBS_V4L2_DEVICE,
@@ -62,18 +66,38 @@ def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=(
             "CorridorKey v2 real-time GPU keying for live streamers "
-            "(Windows + Linux). Preferred OBS path: --obs "
-            f"(default backend {DEFAULT_OBS_BACKEND})."
+            "(Windows + Linux). Webcam, desktop capture, or --demo → OBS."
         ))
     ap.add_argument(
         "--source", default="0",
-        help="Capture source: webcam index (0), device path, video file, or URL.")
+        help="Capture source: webcam index (0), device path, video file, URL, "
+             "or 'desktop' / 'monitor:N'.")
+    ap.add_argument(
+        "--desktop", action="store_true",
+        help="Capture the desktop/monitor via mss (Windows + Linux/X11). "
+             "Same as --source desktop. Use --monitor N to pick a display.")
+    ap.add_argument(
+        "--monitor", type=int, default=None,
+        help="Monitor index for desktop capture: 0=all, 1=first display, …")
+    ap.add_argument(
+        "--demo", action="store_true",
+        help="Webcam-free demo: generate/use sample greenscreen clip + plate, "
+             "loop with preview (CUDA still required).")
     ap.add_argument(
         "--background", default=None,
-        help="Background plate image for composite. Default: solid color.")
+        help="Background plate image for composite. Default: solid color "
+             "(ignored with --transparent).")
     ap.add_argument(
         "--background-rgb", type=_parse_rgb, default=(0.08, 0.08, 0.10),
         help="Solid sRGB background when --background is omitted (R,G,B in 0..1).")
+    ap.add_argument(
+        "--transparent", action="store_true",
+        help="Output keyed cutout with alpha (green/background see-through). "
+             "Preview uses a checker; --obs prefers BGRA virtual cam.")
+    ap.add_argument(
+        "--obs-alpha", action="store_true",
+        help="Force BGRA alpha on the OBS virtual camera (implied by "
+             "--transparent). Falls back to cutout-on-black if unsupported.")
     ap.add_argument("--hint-first-frame", default=None,
                     help="Optional first-frame matte hint (same as offline).")
     ap.add_argument("--hint-quality", type=float, default=0.95)
@@ -90,6 +114,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--low-vram", action="store_true",
                     help="Chunked attention; still keeps stages on GPU (no memmaps).")
     ap.add_argument("--weights", default=None)
+    ap.add_argument(
+        "--no-force-green", action="store_true",
+        help="Disable extra chroma-green→transparent pass (on by default with "
+             "--desktop / --transparent).")
 
     # --- OBS / outputs ---
     ap.add_argument(
@@ -97,7 +125,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Streamer mode: GPU-key and feed a virtual camera for OBS "
             f"(default backend: {DEFAULT_OBS_BACKEND}, Windows+Linux). "
-            "Preview defaults off."
+            "Preview defaults off (unless --demo / --transparent / --preview)."
         ))
     ap.add_argument(
         "--obs-backend", choices=("pyvirtualcam", "v4l2"),
@@ -114,14 +142,12 @@ def build_argparser() -> argparse.ArgumentParser:
             f"pyvirtualcam's device (default {DEFAULT_OBS_V4L2_DEVICE})."
         ))
     ap.add_argument("--preview", action=argparse.BooleanOptionalAction, default=None,
-                    help="OpenCV preview window (press q to quit). "
-                         "Default: on, unless --obs (then off).")
-    ap.add_argument("--preview-mode", choices=("composite", "alpha", "fg"),
+                    help="OpenCV preview window (press q to quit).")
+    ap.add_argument("--preview-mode", choices=("composite", "alpha", "fg", "checker"),
                     default="composite")
     ap.add_argument("--no-fps-overlay", action="store_true")
     ap.add_argument("--virtual-cam", action="store_true",
-                    help="Enable pyvirtualcam without --obs (same as --obs "
-                         "with preview still defaulting on).")
+                    help="Enable pyvirtualcam without --obs.")
     ap.add_argument(
         "--ffmpeg-out", default=None,
         help="Optional extra sink: pipe composite to ffmpeg (file / RTMP / MPEG-TS).")
@@ -141,11 +167,13 @@ def build_argparser() -> argparse.ArgumentParser:
 def _resolve_preview(args: argparse.Namespace) -> bool:
     if args.preview is not None:
         return bool(args.preview)
+    # Demo / transparent desktop UX wants an on-screen window by default.
+    if args.demo or args.transparent:
+        return True
     return not bool(args.obs)
 
 
 def _resolve_v4l2_device(args: argparse.Namespace, backend: str) -> str | None:
-    """Only resolve a v4l2 path when on Linux and needed."""
     if args.v4l2_device:
         if not is_linux():
             raise RuntimeError(
@@ -159,7 +187,6 @@ def _resolve_v4l2_device(args: argparse.Namespace, backend: str) -> str | None:
 
 
 def run_check_obs() -> int:
-    """Doctor: CUDA + virtual-camera readiness (Windows + Linux)."""
     print("CorridorKey OBS readiness check")
     print("===============================")
     print(f"  Platform: {sys.platform}")
@@ -172,6 +199,14 @@ def run_check_obs() -> int:
 
     pvc = pyvirtualcam_available()
     print(f"  pyvirtualcam: {'OK' if pvc else 'MISSING (pip install pyvirtualcam)'}")
+
+    try:
+        from corridorkey.desktop_capture import list_monitors
+        mons = list_monitors()
+        print(f"  mss desktop capture: OK ({len(mons)} monitor entries, "
+              f"0=all … {len(mons) - 1})")
+    except Exception as exc:
+        print(f"  mss desktop capture: MISSING ({exc})")
 
     if is_linux():
         devices = list_v4l2_device_names()
@@ -188,12 +223,14 @@ def run_check_obs() -> int:
             print("  → sudo bash scripts/setup_obs_vcam_linux.sh")
         linux_ok = exists
     else:
-        linux_ok = True  # not applicable
+        linux_ok = True
         if is_windows():
-            print("  Windows virtual cam: provided by pyvirtualcam (no v4l2)")
+            print("  Windows virtual cam: provided by pyvirtualcam (BGRA alpha OK)")
 
     print()
     print(obs_setup_instructions(backend=DEFAULT_OBS_BACKEND))
+    print("Desktop greenscreen tip:")
+    print("  python live_stream.py --desktop --obs --transparent --preview")
 
     ready = cuda_ok and pvc and linux_ok
     if not ready:
@@ -209,9 +246,32 @@ def main(argv: list[str] | None = None) -> int:
 
     require_cuda_gpu("live streaming / OBS feed")
     backend = validate_obs_backend(args.obs_backend)
-
     package_root = Path(__file__).resolve().parent
-    paths = RuntimePaths.from_package(package_root, args.weights)
+
+    # --- demo assets (non-blocking optional path) ---
+    if args.demo:
+        from corridorkey.demo_assets import ensure_demo_assets
+        clip, plate = ensure_demo_assets(package_root, ffmpeg_bin=args.ffmpeg_bin)
+        args.source = str(clip)
+        if args.background is None and not args.transparent:
+            args.background = str(plate)
+        args.loop = True
+        print(f"Demo mode: source={args.source}  background={args.background}")
+
+    use_desktop, monitor = parse_desktop_source(
+        args.source, bool(args.desktop), args.monitor)
+    if use_desktop:
+        args.desktop = True
+
+    transparent = bool(args.transparent)
+    # Desktop greenscreen UX: force green→transparent unless opted out.
+    force_green = (
+        not args.no_force_green
+        and (use_desktop or transparent or args.demo)
+    )
+    if use_desktop and not args.no_force_green:
+        transparent = True  # default transparent cutout for desktop
+
     live_cfg = LiveConfig(
         model_scale=args.model_scale,
         hint_quality=args.hint_quality,
@@ -222,13 +282,13 @@ def main(argv: list[str] | None = None) -> int:
         background_rgb=args.background_rgb,
         mirror=args.mirror,
         target_fps=args.target_fps,
+        force_green_transparent=force_green,
     )
 
     preview = _resolve_preview(args)
     use_obs = bool(args.obs or args.virtual_cam)
     v4l2_device = _resolve_v4l2_device(args, backend) if use_obs else (
         args.v4l2_device if args.v4l2_device else None)
-    # pyvirtualcam path: virtual_cam flag; v4l2 path: device only.
     virtual_cam = use_obs and backend == "pyvirtualcam"
     if use_obs and backend == "v4l2":
         virtual_cam = False
@@ -248,15 +308,25 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 "pip install pyvirtualcam  # required for --obs on Windows and Linux")
 
+    paths = RuntimePaths.from_package(package_root, args.weights)
     print("Loading model for live path (CUDA: foundations + stage1 + stage2)...")
     model = load_model(paths, device="cuda")
 
-    source = parse_capture_source(args.source)
-    cap = open_capture(source)
-    ok, probe = cap.read()
-    cap.release()
-    if not ok or probe is None:
-        raise RuntimeError(f"Could not read a probe frame from {args.source!r}")
+    # Probe size for hint / meta
+    if use_desktop:
+        from corridorkey.desktop_capture import DesktopCapture
+        probe_cap = DesktopCapture(monitor=monitor)
+        probe = probe_cap.read()
+        probe_cap.close()
+        source: str | int | None = None
+    else:
+        source = parse_capture_source(args.source)
+        cap = open_capture(source)
+        ok, probe = cap.read()
+        cap.release()
+        if not ok or probe is None:
+            raise RuntimeError(f"Could not read a probe frame from {args.source!r}")
+
     h, w = probe.shape[:2]
     fps = args.target_fps if args.target_fps > 0 else 30.0
     meta = build_live_meta(
@@ -267,9 +337,11 @@ def main(argv: list[str] | None = None) -> int:
     session = LiveKeySession(
         model, live_cfg, device="cuda", initial_hint=initial_hint)
     print(
-        f"Live ready (GPU): platform={sys.platform}  source={args.source!r}  "
-        f"capture={w}x{h}  model_grid={meta['shape_hw'][1]}x{meta['shape_hw'][0]}  "
-        f"obs={use_obs}  backend={backend}  v4l2={v4l2_device!r}  preview={preview}")
+        f"Live ready (GPU): platform={sys.platform}  "
+        f"desktop={use_desktop} monitor={monitor if use_desktop else '-'}  "
+        f"source={args.source!r}  capture={w}x{h}  "
+        f"transparent={transparent}  force_green={force_green}  "
+        f"obs={use_obs}  backend={backend}  preview={preview}")
 
     if not preview and not virtual_cam and not v4l2_device and not args.ffmpeg_out:
         print("warning: no sinks enabled; enabling preview so the loop is visible",
@@ -279,12 +351,16 @@ def main(argv: list[str] | None = None) -> int:
     stats = run_live_loop(
         session,
         source,
+        desktop=use_desktop,
+        monitor=monitor if use_desktop else 0,
         background_path=args.background,
         preview=preview,
         preview_mode=args.preview_mode,
         virtual_cam=virtual_cam,
         v4l2_device=v4l2_device if (backend == "v4l2" or args.v4l2_device) else None,
         obs_backend=backend,
+        obs_alpha=bool(args.obs_alpha or transparent),
+        transparent=transparent,
         ffmpeg_out=args.ffmpeg_out,
         ffmpeg_bin=args.ffmpeg_bin,
         max_frames=args.max_frames,

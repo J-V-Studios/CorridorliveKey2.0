@@ -73,6 +73,12 @@ class LiveConfig:
     background_rgb: tuple[float, float, float] = (0.08, 0.08, 0.10)
     mirror: bool = False
     target_fps: float = 0.0  # 0 = uncapped
+    # Force chroma-green pixels toward alpha=0 (desktop green-window UX).
+    force_green_transparent: bool = False
+    green_hue_center: float = 60.0   # OpenCV HSV degrees-ish (H in 0..180 → *2)
+    green_hue_width: float = 25.0
+    green_sat_min: float = 0.35
+    green_val_min: float = 0.20
 
 
 def build_live_meta(
@@ -329,7 +335,8 @@ class LiveKeySession:
             if isinstance(logits, tuple):
                 logits = logits[0]
 
-        rendered = self._render_live(meta, logits[0], background_bgr)
+        rendered = self._render_live(
+            meta, logits[0], background_bgr, source_bgr=frame_bgr)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -338,16 +345,44 @@ class LiveKeySession:
         rendered["frame_index"] = self._frame_index - 1
         return rendered
 
+    def _green_keep_mask(self, source_bgr: np.ndarray, hw: tuple[int, int]) -> torch.Tensor:
+        """Return (1,1,H,W) keep-mask in [0,1] — 0 on chroma green, 1 elsewhere.
+
+        Uses OpenCV HSV (H in 0..179). Default center 60 ≈ pure green.
+        """
+        h, w = hw
+        if source_bgr.shape[:2] != (h, w):
+            source_bgr = cv2.resize(source_bgr, (w, h), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hue = hsv[..., 0]
+        sat = hsv[..., 1] / 255.0
+        val = hsv[..., 2] / 255.0
+        center = float(self.cfg.green_hue_center)  # OpenCV H units
+        width = float(self.cfg.green_hue_width)
+        dh = np.abs(hue - center)
+        dh = np.minimum(dh, 180.0 - dh)
+        core = (dh <= width * 0.55) & (sat >= self.cfg.green_sat_min) & (
+            val >= self.cfg.green_val_min)
+        # Soft falloff outside the core
+        soft = np.clip((dh - width * 0.35) / max(width * 0.65, 1e-3), 0.0, 1.0)
+        keep = np.where(core, 0.0, soft).astype(np.float32)
+        return torch.from_numpy(keep)[None, None].to(self.device)
+
     def _render_live(
         self,
         meta: dict,
         logits: torch.Tensor,
         background_bgr: np.ndarray | None,
+        *,
+        source_bgr: np.ndarray | None = None,
     ) -> dict[str, Any]:
-        """Render alpha / fg / composite as native-resolution uint8 BGR."""
+        """Render alpha / fg / composite / BGRA cutout at native resolution."""
         alpha_model = logits[0:1].float()
         pa = _resize_output_torch(
             _crop_native_torch(alpha_model, meta).clamp(0.0, 1.0), meta)
+        if self.cfg.force_green_transparent and source_bgr is not None:
+            keep = self._green_keep_mask(source_bgr, meta["output_hw"])
+            pa = (pa * keep).clamp(0.0, 1.0)
         fg_model = logits[1:4].float()
         pf_model = _crop_native_torch(fg_model, meta)
         pf_linear = _linear_adjust_inverse_torch(cu.asinh_to_linear(pf_model), meta)
@@ -361,6 +396,9 @@ class LiveKeySession:
         alpha_bgr = cv2.cvtColor(alpha_u8, cv2.COLOR_GRAY2BGR)
         fg_u8 = (pf[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
         fg_bgr = cv2.cvtColor(fg_u8, cv2.COLOR_RGB2BGR)
+
+        # Straight BGRA cutout (transparent where alpha=0) for OBS virt-cam alpha.
+        cutout_bgra = np.dstack([fg_bgr, alpha_u8])
 
         h, w = meta["output_hw"]
         if background_bgr is None:
@@ -380,10 +418,22 @@ class LiveKeySession:
         comp_u8 = (comp[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
         composite_bgr = cv2.cvtColor(comp_u8, cv2.COLOR_RGB2BGR)
 
+        # Checker preview for transparent mode (see-through green → checker).
+        checker = make_checker(h, w)
+        checker_t = torch.from_numpy(checker).to(
+            device=pf.device, dtype=pf.dtype).unsqueeze(0)
+        chk_lin = cu.srgb_to_linear(checker_t)
+        chk_comp = cu.linear_to_srgb(
+            (fg_lin * pa + chk_lin * (1.0 - pa)).clamp(min=0.0)).clamp(0.0, 1.0)
+        checker_u8 = (chk_comp[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        checker_bgr = cv2.cvtColor(checker_u8, cv2.COLOR_RGB2BGR)
+
         return {
             "alpha_u8": alpha_bgr,
             "fg_u8": fg_bgr,
             "composite_u8": composite_bgr,
+            "checker_u8": checker_bgr,
+            "cutout_bgra": cutout_bgra,
             "alpha": pa.detach().cpu(),
         }
 
@@ -630,6 +680,9 @@ class VirtualCamSink:
 
     Windows: DirectShow virtual camera (driver may install on first use).
     Linux: uses a v4l2loopback device under the hood (see setup script).
+
+    When ``with_alpha=True``, prefers BGRA so OBS can composite transparency
+    (supported on Windows; Linux v4l2 often falls back to opaque BGR — see docs).
     """
 
     def __init__(
@@ -639,6 +692,7 @@ class VirtualCamSink:
         fps: float,
         *,
         device: str | None = None,
+        with_alpha: bool = False,
     ):
         try:
             import pyvirtualcam  # type: ignore
@@ -651,28 +705,62 @@ class VirtualCamSink:
                 "Linux-only alternative without pyvirtualcam: "
                 "--obs-backend v4l2"
             ) from exc
+        self.with_alpha = bool(with_alpha)
+        self._alpha_fallback_warned = False
+        fmt = (
+            pyvirtualcam.PixelFormat.BGRA if self.with_alpha
+            else pyvirtualcam.PixelFormat.BGR
+        )
         kwargs: dict[str, Any] = {
             "width": int(width),
             "height": int(height),
             "fps": float(fps),
-            "fmt": pyvirtualcam.PixelFormat.BGR,
+            "fmt": fmt,
         }
-        # device= is Linux v4l2 path; ignore on Windows if unsupported.
         if device and is_linux():
             kwargs["device"] = device
         try:
             self._cam = pyvirtualcam.Camera(**kwargs)
-        except TypeError:
+        except (TypeError, RuntimeError, ValueError):
+            # Older pyvirtualcam / Linux v4l2 without BGRA — fall back to BGR.
             kwargs.pop("device", None)
-            self._cam = pyvirtualcam.Camera(**kwargs)
+            if self.with_alpha:
+                kwargs["fmt"] = pyvirtualcam.PixelFormat.BGR
+                self.with_alpha = False
+                print(
+                    "  [note] Virtual cam has no BGRA alpha on this platform; "
+                    "sending opaque BGR cutout-on-black. On Windows, BGRA usually "
+                    "works. Linux OBS: use the preview checker or see README.",
+                    flush=True,
+                )
+            try:
+                self._cam = pyvirtualcam.Camera(**kwargs)
+            except TypeError:
+                kwargs.pop("fmt", None)
+                self._cam = pyvirtualcam.Camera(**kwargs)
+                self.with_alpha = False
         self.device = getattr(self._cam, "device", device or "(pyvirtualcam)")
 
-    def write(self, frame_bgr: np.ndarray) -> None:
-        if frame_bgr.shape[1] != self._cam.width or frame_bgr.shape[0] != self._cam.height:
-            frame_bgr = cv2.resize(
-                frame_bgr, (self._cam.width, self._cam.height),
+    def write(self, frame: np.ndarray) -> None:
+        """Accept BGR (HxWx3) or BGRA (HxWx4)."""
+        if frame.shape[1] != self._cam.width or frame.shape[0] != self._cam.height:
+            frame = cv2.resize(
+                frame, (self._cam.width, self._cam.height),
                 interpolation=cv2.INTER_AREA)
-        self._cam.send(frame_bgr)
+        if self.with_alpha:
+            if frame.shape[2] == 3:
+                frame = np.dstack([
+                    frame,
+                    np.full(frame.shape[:2], 255, dtype=np.uint8),
+                ])
+            self._cam.send(np.ascontiguousarray(frame))
+        else:
+            if frame.shape[2] == 4:
+                # Composite straight BGRA over black for opaque virt cams.
+                bgr = frame[:, :, :3].astype(np.float32)
+                a = frame[:, :, 3:4].astype(np.float32) / 255.0
+                frame = np.clip(bgr * a, 0, 255).astype(np.uint8)
+            self._cam.send(np.ascontiguousarray(frame))
         self._cam.sleep_until_next_frame()
 
     def close(self) -> None:
@@ -723,24 +811,32 @@ def iter_capture_frames(
             break
 
 
-def _preview_key(preview_mode: str) -> str:
+def _preview_key(preview_mode: str, *, transparent: bool = False) -> str:
+    if transparent and preview_mode == "composite":
+        return "checker_u8"
     return {
         "composite": "composite_u8",
         "alpha": "alpha_u8",
         "fg": "fg_u8",
+        "checker": "checker_u8",
+        "cutout": "cutout_bgra",
     }.get(preview_mode, "composite_u8")
 
 
 def run_live_loop(
     session: LiveKeySession,
-    source: str | int,
+    source: str | int | None = None,
     *,
+    desktop: bool = False,
+    monitor: int = 0,
     background_path: str | None = None,
     preview: bool = True,
     preview_mode: str = "composite",
     virtual_cam: bool = False,
     v4l2_device: str | None = None,
     obs_backend: str = DEFAULT_OBS_BACKEND,
+    obs_alpha: bool = False,
+    transparent: bool = False,
     ffmpeg_out: str | None = None,
     ffmpeg_bin: str = "ffmpeg",
     ffmpeg_extra: list[str] | None = None,
@@ -748,36 +844,60 @@ def run_live_loop(
     loop_file: bool = False,
     show_fps: bool = True,
 ) -> LiveLoopStats:
-    """Capture → GPU key → composite → sinks. Blocks until EOF / max_frames / 'q'.
+    """Capture → GPU key → composite/cutout → sinks.
 
-    OBS (Windows + Linux): ``virtual_cam=True`` with backend ``pyvirtualcam``.
-    Linux-only alternative: ``obs_backend='v4l2'`` + ``v4l2_device``.
+    ``desktop=True`` uses mss screen capture (Windows + Linux/X11).
+    ``transparent`` / ``obs_alpha`` send BGRA cutout so green/keyed areas are
+    see-through in OBS when the virtual camera supports alpha.
     """
     require_cuda_gpu("live loop")
     backend = validate_obs_backend(obs_backend) if (virtual_cam or v4l2_device) else obs_backend
-    cap = open_capture(source)
+    desktop_cap = None
+    cap = None
+    if desktop:
+        from .desktop_capture import DesktopCapture
+        desktop_cap = DesktopCapture(monitor=monitor)
+        print(f"  Desktop capture: {desktop_cap.description}", flush=True)
+        frame_iter = desktop_cap.frames(max_frames=max_frames)
+        fps = float(session.cfg.target_fps) if session.cfg.target_fps > 0 else 30.0
+    else:
+        if source is None:
+            raise ValueError("source is required unless desktop=True")
+        cap = open_capture(source)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
+        if session.cfg.target_fps > 0:
+            fps = float(session.cfg.target_fps)
+        frame_iter = iter_capture_frames(
+            cap, max_frames=max_frames, loop_file=loop_file)
+
     stats = LiveLoopStats()
     sink_ffmpeg: FFmpegFrameSink | None = None
     sink_v4l2: V4L2LoopbackSink | None = None
     sink_vcam: VirtualCamSink | None = None
     background: np.ndarray | None = None
     window = "CorridorKey Live"
+    use_alpha = bool(obs_alpha or transparent)
     try:
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
-        if session.cfg.target_fps > 0:
-            fps = float(session.cfg.target_fps)
-        out_key = _preview_key(preview_mode)
-        for frame in iter_capture_frames(
-                cap, max_frames=max_frames, loop_file=loop_file):
+        out_key = _preview_key(preview_mode, transparent=transparent)
+        for frame in frame_iter:
             meta = session.ensure_meta(frame, fps=fps)
             h, w = meta["output_hw"]
-            if background is None:
+            if background is None and not transparent:
                 background = load_background_bgr(
                     background_path, (h, w), session.cfg.background_rgb)
             result = session.process_frame(
-                frame, background_bgr=background, fps=fps)
+                frame,
+                background_bgr=None if transparent else background,
+                fps=fps,
+            )
             stats.record(result["latency_ms"])
-            out = result[out_key]
+            preview_frame = result.get(out_key, result["composite_u8"])
+            if preview_frame.ndim == 3 and preview_frame.shape[2] == 4:
+                # Preview window: show BGRA over checker
+                preview_frame = result["checker_u8"]
+            obs_frame = (
+                result["cutout_bgra"] if use_alpha else result["composite_u8"]
+            )
             want_obs = virtual_cam or (v4l2_device is not None)
             if want_obs:
                 if sink_v4l2 is None and sink_vcam is None:
@@ -788,29 +908,48 @@ def run_live_loop(
                                 f"(e.g. {DEFAULT_OBS_V4L2_DEVICE})")
                         sink_v4l2 = V4L2LoopbackSink(
                             v4l2_device, w, h, fps, ffmpeg_bin=ffmpeg_bin)
-                        print(f"  OBS feed (Linux v4l2): {v4l2_device}",
+                        print(f"  OBS feed (Linux v4l2, opaque): {v4l2_device}",
                               flush=True)
+                        if use_alpha:
+                            print(
+                                "  [note] v4l2 backend is RGB-only; cutout is "
+                                "composited on black. Prefer --obs-backend "
+                                "pyvirtualcam on Windows for BGRA alpha.",
+                                flush=True)
                     else:
                         sink_vcam = VirtualCamSink(
                             w, h, fps,
-                            device=v4l2_device if is_linux() else None)
-                        print(f"  OBS feed (pyvirtualcam): {sink_vcam.device}",
-                              flush=True)
+                            device=v4l2_device if is_linux() else None,
+                            with_alpha=use_alpha,
+                        )
+                        print(
+                            f"  OBS feed (pyvirtualcam"
+                            f"{', BGRA alpha' if sink_vcam.with_alpha else ''}): "
+                            f"{sink_vcam.device}",
+                            flush=True)
                 if sink_v4l2 is not None:
-                    sink_v4l2.write(out)
+                    # v4l2: always BGR
+                    bgr = obs_frame
+                    if bgr.shape[2] == 4:
+                        a = bgr[:, :, 3:4].astype(np.float32) / 255.0
+                        bgr = np.clip(
+                            bgr[:, :, :3].astype(np.float32) * a, 0, 255
+                        ).astype(np.uint8)
+                    sink_v4l2.write(bgr)
                 else:
                     assert sink_vcam is not None
-                    sink_vcam.write(out)
+                    sink_vcam.write(obs_frame)
             if ffmpeg_out:
                 if sink_ffmpeg is None:
                     sink_ffmpeg = FFmpegFrameSink(
                         ffmpeg_out, w, h, fps,
                         ffmpeg_bin=ffmpeg_bin, extra_args=ffmpeg_extra)
-                sink_ffmpeg.write(out)
+                bgr = obs_frame if obs_frame.shape[2] == 3 else result["composite_u8"]
+                sink_ffmpeg.write(bgr)
             if preview:
-                view = out
+                view = preview_frame
                 if show_fps:
-                    view = out.copy()
+                    view = preview_frame.copy()
                     ms = result["latency_ms"]
                     inst = 1000.0 / ms if ms > 1e-3 else 0.0
                     cv2.putText(
@@ -821,7 +960,10 @@ def run_live_loop(
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
+        if desktop_cap is not None:
+            desktop_cap.close()
         if sink_ffmpeg is not None:
             sink_ffmpeg.close()
         if sink_v4l2 is not None:
