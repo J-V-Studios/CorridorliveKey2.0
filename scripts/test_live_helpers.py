@@ -84,6 +84,27 @@ def main() -> int:
     stats.record(12.0)
     assert "frames=1" in stats.summary()
 
+    # Despill must accept RGB and preserve optional alpha (regression for
+    # transparent desktop path that previously passed 4ch into the blend).
+    import torch
+    from corridorkey.runtime import _despill_average_srgb_torch
+    rgb = torch.rand(1, 3, 8, 8)
+    out = _despill_average_srgb_torch(rgb, strength=0.5)
+    assert out.shape == (1, 3, 8, 8)
+    rgba = torch.rand(1, 4, 8, 8)
+    out_a = _despill_average_srgb_torch(rgba, strength=0.5)
+    assert out_a.shape == (1, 4, 8, 8)
+    assert torch.allclose(out_a[:, 3:4], rgba[:, 3:4])
+
+    # Channel split for live render: (N,4,H,W) uses dim-1, not dim-0.
+    fake = torch.zeros(1, 4, 16, 16)
+    fake[:, 0] = 0.25
+    fake[:, 1:4] = 0.5
+    assert fake[:, 0:1].shape[1] == 1
+    assert fake[:, 1:4].shape[1] == 3
+    # The old bug: fake[0:1] is still 4-channel
+    assert fake[0:1].shape[1] == 4
+
     print("live helpers ok")
     return 0
 

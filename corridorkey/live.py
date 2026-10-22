@@ -376,25 +376,39 @@ class LiveKeySession:
         *,
         source_bgr: np.ndarray | None = None,
     ) -> dict[str, Any]:
-        """Render alpha / fg / composite / BGRA cutout at native resolution."""
-        alpha_model = logits[0:1].float()
+        """Render alpha / fg / composite / BGRA cutout at native resolution.
+
+        ``logits`` must be ``(N, 4, H, W)`` or ``(4, H, W)`` — channel 0 is
+        alpha, channels 1:4 are RGB (same layout as the offline render path).
+        """
+        if logits.ndim == 3:
+            logits = logits.unsqueeze(0)
+        if logits.ndim != 4 or logits.shape[1] < 4:
+            raise ValueError(
+                f"expected logits (N, 4, H, W) or (4, H, W); got {tuple(logits.shape)}")
+        # Channel axis is dim 1 (NOT dim 0). Dim-0 slicing was treating the
+        # whole 4-channel frame as alpha and broke despill on desktop/transparent.
+        alpha_model = logits[:, 0:1].float()
+        fg_model = logits[:, 1:4].float()
         pa = _resize_output_torch(
             _crop_native_torch(alpha_model, meta).clamp(0.0, 1.0), meta)
         if self.cfg.force_green_transparent and source_bgr is not None:
             keep = self._green_keep_mask(source_bgr, meta["output_hw"])
-            pa = (pa * keep).clamp(0.0, 1.0)
-        fg_model = logits[1:4].float()
+            pa = (pa * keep.to(device=pa.device, dtype=pa.dtype)).clamp(0.0, 1.0)
         pf_model = _crop_native_torch(fg_model, meta)
         pf_linear = _linear_adjust_inverse_torch(cu.asinh_to_linear(pf_model), meta)
         pf_linear_pos = pf_linear.clamp(min=0.0)
         pf = _resize_output_torch(
             cu.linear_to_srgb(pf_linear_pos), meta).clamp(0.0, 1.0)
+        if pf.shape[1] != 3:
+            raise RuntimeError(
+                f"foreground must be RGB (3ch) before despill; got {tuple(pf.shape)}")
         strength = float(meta.get("despill_strength", 0.5))
         pf_despill = _despill_average_srgb_torch(pf, strength=strength)
 
         alpha_u8 = (pa[0, 0].clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
         alpha_bgr = cv2.cvtColor(alpha_u8, cv2.COLOR_GRAY2BGR)
-        fg_u8 = (pf[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        fg_u8 = (pf_despill[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
         fg_bgr = cv2.cvtColor(fg_u8, cv2.COLOR_RGB2BGR)
 
         # Straight BGRA cutout (transparent where alpha=0) for OBS virt-cam alpha.
