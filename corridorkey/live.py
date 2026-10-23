@@ -756,9 +756,11 @@ class VirtualCamSink:
             kwargs["fmt"] = fmt
         if device and is_linux():
             kwargs["device"] = device
+        last_err: Exception | None = None
         try:
             self._cam = pyvirtualcam.Camera(**kwargs)
-        except (TypeError, RuntimeError, ValueError, OSError):
+        except (TypeError, RuntimeError, ValueError, OSError) as exc:
+            last_err = exc
             # Retry without device pin / without alpha fmt.
             kwargs.pop("device", None)
             if self.with_alpha and fmt_bgr is not None:
@@ -771,10 +773,29 @@ class VirtualCamSink:
                 )
             try:
                 self._cam = pyvirtualcam.Camera(**kwargs)
-            except TypeError:
+                last_err = None
+            except (TypeError, RuntimeError, ValueError, OSError) as exc2:
+                last_err = exc2
                 kwargs.pop("fmt", None)
-                self._cam = pyvirtualcam.Camera(**kwargs)
-                self.with_alpha = False
+                try:
+                    self._cam = pyvirtualcam.Camera(**kwargs)
+                    last_err = None
+                except (TypeError, RuntimeError, ValueError, OSError) as exc3:
+                    last_err = exc3
+        if last_err is not None:
+            hint = str(last_err)
+            raise RuntimeError(
+                "Could not open a virtual camera for --obs.\n"
+                f"  Underlying error: {hint}\n"
+                "Linux fix (Arch):\n"
+                "  sudo pacman -S v4l2loopback-dkms linux-headers\n"
+                "  sudo bash scripts/setup_obs_vcam_linux.sh\n"
+                "  # or: sudo modprobe v4l2loopback devices=1 video_nr=10 "
+                "card_label=CorridorKey exclusive_caps=1\n"
+                "Then re-run. Check with: python live_stream.py --check-obs\n"
+                "Also: --source should be your real webcam (often 0), not 10 "
+                "(/dev/video10 is usually the CorridorKey output loopback)."
+            ) from last_err
         self.device = getattr(self._cam, "device", device or "(pyvirtualcam)")
 
     def write(self, frame: np.ndarray) -> None:
