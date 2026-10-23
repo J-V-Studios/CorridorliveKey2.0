@@ -147,13 +147,24 @@ def load_background_bgr(
     hw: tuple[int, int],
     solid_rgb: tuple[float, float, float],
 ) -> np.ndarray:
-    """Return uint8 BGR background matching ``hw`` (H, W)."""
+    """Return uint8 BGR background matching ``hw`` (H, W).
+
+    If ``path`` is set but missing/unreadable, fall back to ``solid_rgb`` with
+    a warning (docs often use a placeholder like ``plate.png``).
+    """
     h, w = hw
     if path:
-        img = read_image_rgb(path)
-        img = np.clip(img, 0.0, 1.0)
-        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-        return cv2.cvtColor((img * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        try:
+            img = read_image_rgb(path)
+            img = np.clip(img, 0.0, 1.0)
+            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+            return cv2.cvtColor((img * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            print(
+                f"  [warning] background {path!r} not loaded ({exc}); "
+                f"using solid RGB {solid_rgb}",
+                flush=True,
+            )
     rgb = np.array(solid_rgb, dtype=np.float32).reshape(1, 1, 3)
     rgb = np.clip(rgb, 0.0, 1.0)
     bgr = rgb[0, 0, ::-1]
@@ -548,6 +559,7 @@ Shared notes (Windows + Linux)
   keyed and composited on the GPU.
 - Fit the source to the canvas; set OBS canvas to your stream size
   (e.g. 1920x1080).
+- --background needs a real image path, or omit it for a solid color.
 """
     windows = f"""\
 Windows OBS steps
@@ -555,7 +567,7 @@ Windows OBS steps
 1. One-time: pip install pyvirtualcam
    (first run may install a virtual-camera driver; approve UAC if prompted.)
 2. Start the keyer:
-     python live_stream.py --obs --source 0 --background plate.png
+     python live_stream.py --obs --source 0 --preview
 3. In OBS: Sources → + → Video Capture Device
 4. Device: select the virtual camera (often "OBS Virtual Camera", or the
    name printed by live_stream — currently: {device})
@@ -569,8 +581,8 @@ Linux OBS steps (default backend: pyvirtualcam)
      # pyvirtualcam on Linux needs a v4l2loopback device:
      sudo apt install v4l2loopback-dkms v4l2loopback-utils   # Debian/Ubuntu
      sudo bash scripts/setup_obs_vcam_linux.sh
-2. Start the keyer:
-     python live_stream.py --obs --source 0 --background plate.png
+2. Start the keyer (use your real webcam index, often 0 — not /dev/video10):
+     python live_stream.py --obs --source 0 --preview
 3. In OBS: Sources → + → Video Capture Device (V4L2)
 4. Device: select the virtual camera / CorridorKey / {v4l2}
 5. Resolution/FPS: match your webcam, or Automatic.
@@ -584,7 +596,6 @@ Linux-only alternative (no pyvirtualcam): ffmpeg → v4l2loopback
         f"`v4l2` is Linux-only)\n"
     )
     return backend_note + "\n" + common + "\n" + windows + "\n" + linux
-
 
 def validate_obs_backend(backend: str) -> str:
     """Normalize backend; gate Linux-only v4l2."""

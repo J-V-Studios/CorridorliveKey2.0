@@ -128,12 +128,17 @@ keys out. Press `q` in the preview to quit.
 
 ```
 pip install pyvirtualcam
-python live_stream.py --obs --source 0 --background plate.png
+# solid dark background (no plate file needed):
+python live_stream.py --obs --source 0 --preview
+# or composite over your own image:
+python live_stream.py --obs --source 0 --background /path/to/your_plate.png --preview
 ```
 
 CorridorKey keys/composites on the GPU, then publishes the result as a virtual
 webcam. With an opaque plate you usually **do not** need an OBS Chroma Key
 filter. With `--transparent`, prefer BGRA on Windows (see table above).
+`--background plate.png` in older examples was a **placeholder path** — use a
+real image file, or omit `--background` for the default solid color.
 
 Check readiness (no model load):
 
@@ -152,8 +157,8 @@ python live_stream.py --demo --preview
 Useful knobs:
 
 ```
-python live_stream.py --obs --source 0 --background plate.png --mirror --model-scale 0.5
-python live_stream.py --obs --source 0 --background plate.png --preview
+python live_stream.py --obs --source 0 --preview --mirror --model-scale 0.5
+python live_stream.py --obs --source 0 --background ~/Pictures/office.png --preview
 ```
 
 ### Windows OBS setup
@@ -163,7 +168,7 @@ python live_stream.py --obs --source 0 --background plate.png --preview
 2. First virtual-cam run may install a driver — approve UAC if prompted.
 3. Start the keyer (webcam **or** desktop greenscreen):
    ```
-   python live_stream.py --obs --source 0 --background plate.png
+   python live_stream.py --obs --source 0 --preview
    python live_stream.py --desktop --obs --transparent --preview
    ```
 4. In OBS: **Sources → + → Video Capture Device**.
@@ -191,7 +196,7 @@ python live_stream.py --obs --source 0 --background plate.png --preview
    XWayland.)
 2. Start the keyer:
    ```
-   python live_stream.py --obs --source 0 --background plate.png
+   python live_stream.py --obs --source 0 --preview
    python live_stream.py --desktop --obs --transparent --preview
    ```
 3. In OBS: **Sources → + → Video Capture Device (V4L2)** (some builds omit

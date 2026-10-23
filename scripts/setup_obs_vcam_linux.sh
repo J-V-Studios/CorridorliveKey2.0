@@ -62,7 +62,7 @@ fi
 echo "OK: ${DEV} ready (label=${CARD_LABEL}, exclusive_caps=1)"
 echo
 echo "Next:"
-echo "  python live_stream.py --obs --source 0 --background plate.png"
+echo "  python live_stream.py --obs --source 0 --preview"
 echo "  OBS → Sources → + → Video Capture Device (V4L2) → ${CARD_LABEL} / ${DEV}"
 echo
 echo "Tip: to persist across reboots, add a modprobe.d snippet, e.g."

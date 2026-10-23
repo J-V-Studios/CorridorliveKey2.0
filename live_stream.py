@@ -6,7 +6,7 @@ Windows + Linux. Capture from webcam, file, **desktop/monitor**, or ``--demo``.
 Examples::
 
   # Webcam → OBS virtual camera
-  python live_stream.py --obs --source 0 --background plate.png
+  python live_stream.py --obs --source 0 --preview
 
   # Desktop greenscreen: green windows become transparent in OBS
   python live_stream.py --desktop --obs --transparent --preview
@@ -235,7 +235,7 @@ def run_check_obs() -> int:
     ready = cuda_ok and pvc and linux_ok
     if not ready:
         return 1
-    print("Ready: python live_stream.py --obs --source 0 --background plate.png")
+    print("Ready: python live_stream.py --obs --source 0 --preview")
     return 0
 
 

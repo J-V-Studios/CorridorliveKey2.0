@@ -23,6 +23,7 @@ def main() -> int:
         LiveLoopStats,
         _preview_key,
         build_live_meta,
+        load_background_bgr,
         obs_setup_instructions,
         parse_capture_source,
         require_cuda_gpu,
@@ -127,6 +128,11 @@ def main() -> int:
     sink = live_mod.VirtualCamSink(64, 48, 30.0, with_alpha=True)
     assert sink.with_alpha is False
     sink.close()
+
+    # Missing plate path must not crash — solid fallback.
+    solid = load_background_bgr(
+        "plate.png_does_not_exist", (32, 48), (0.1, 0.2, 0.3))
+    assert solid.shape == (32, 48, 3)
 
     print("live helpers ok")
     return 0
