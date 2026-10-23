@@ -531,6 +531,106 @@ def find_obs_v4l2_device(
     return None
 
 
+def _is_loopback_card_name(name: str) -> bool:
+    lower = name.lower()
+    return (
+        "loopback" in lower
+        or OBS_V4L2_CARD_LABEL.lower() in lower
+        or "dummy" in lower
+    )
+
+
+def list_v4l2_loopback_devices() -> dict[str, str]:
+    """Return ``{/dev/videoN: card_name}`` for v4l2loopback nodes (Linux)."""
+    if not is_linux():
+        return {}
+    return {
+        dev: name
+        for dev, name in list_v4l2_device_names().items()
+        if _is_loopback_card_name(name)
+    }
+
+
+def v4l2_path_for_capture_source(source: str | int) -> str | None:
+    """Map a webcam index / path to ``/dev/videoN`` when applicable (Linux)."""
+    if not is_linux():
+        return None
+    parsed = parse_capture_source(source)
+    if isinstance(parsed, int):
+        return f"/dev/video{parsed}"
+    text = str(parsed)
+    if text.startswith("/dev/video"):
+        return text
+    return None
+
+
+def warn_if_capture_source_is_loopback(source: str | int) -> None:
+    """Warn when ``--source`` points at the OBS output loopback, not a webcam."""
+    if not is_linux():
+        return
+    path = v4l2_path_for_capture_source(source)
+    if path is None:
+        return
+    devices = list_v4l2_device_names()
+    card = devices.get(path, "")
+    looks_loopback = (
+        path in list_v4l2_loopback_devices()
+        or _is_loopback_card_name(card)
+        or path == DEFAULT_OBS_V4L2_DEVICE
+        or str(parse_capture_source(source)) == "10"
+    )
+    if not looks_loopback:
+        return
+    cams = [
+        f"  {dev}: {name}"
+        for dev, name in devices.items()
+        if not _is_loopback_card_name(name)
+    ]
+    cam_hint = "\n".join(cams) if cams else (
+        "  (no non-loopback V4L2 cameras listed — try --source 0)"
+    )
+    print(
+        f"warning: --source {source!r} looks like the CorridorKey / v4l2loopback "
+        f"output ({path}{f', {card}' if card else ''}), not your webcam.\n"
+        "  Use your real camera index instead, e.g.:\n"
+        "    python live_stream.py --obs --source 0 --preview\n"
+        "  Non-loopback capture devices:\n"
+        f"{cam_hint}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def require_linux_obs_loopback(*, backend: str = DEFAULT_OBS_BACKEND) -> str | None:
+    """Fail fast on Linux --obs if no v4l2loopback node exists (before model load).
+
+    Returns the preferred loopback device path when present, else raises.
+    No-op (returns None) on non-Linux.
+    """
+    if not is_linux():
+        return None
+    backend = (backend or DEFAULT_OBS_BACKEND).strip().lower()
+    # Both pyvirtualcam (Linux) and the v4l2 ffmpeg sink need a loopback node.
+    found = find_obs_v4l2_device(None)
+    if found and Path(found).exists():
+        return found
+    loopbacks = list_v4l2_loopback_devices()
+    if loopbacks:
+        return next(iter(loopbacks))
+    raise RuntimeError(
+        "No v4l2loopback device found — required for --obs on Linux "
+        f"(backend={backend}).\n"
+        "Install + load the module, then re-run:\n"
+        "  Arch:          sudo pacman -S v4l2loopback-dkms linux-headers\n"
+        "  Debian/Ubuntu: sudo apt install v4l2loopback-dkms v4l2loopback-utils\n"
+        "  Fedora:        sudo dnf install v4l2loopback\n"
+        "  sudo bash scripts/setup_obs_vcam_linux.sh\n"
+        "Verify:         python live_stream.py --check-obs\n"
+        "Webcam tip:     use --source 0 (real camera), not --source 10 "
+        f"({DEFAULT_OBS_V4L2_DEVICE} is the virtual-cam *output*)."
+    )
+
+
 def pyvirtualcam_available() -> bool:
     try:
         import pyvirtualcam  # noqa: F401
@@ -579,7 +679,9 @@ Linux OBS steps (default backend: pyvirtualcam)
 1. One-time:
      pip install pyvirtualcam
      # pyvirtualcam on Linux needs a v4l2loopback device:
-     sudo apt install v4l2loopback-dkms v4l2loopback-utils   # Debian/Ubuntu
+     #   Arch:          sudo pacman -S v4l2loopback-dkms linux-headers
+     #   Debian/Ubuntu: sudo apt install v4l2loopback-dkms v4l2loopback-utils
+     #   Fedora:        sudo dnf install v4l2loopback
      sudo bash scripts/setup_obs_vcam_linux.sh
 2. Start the keyer (use your real webcam index, often 0 — not /dev/video10):
      python live_stream.py --obs --source 0 --preview

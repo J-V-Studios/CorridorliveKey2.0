@@ -44,8 +44,10 @@ from corridorkey.live import (
     parse_capture_source,
     pyvirtualcam_available,
     require_cuda_gpu,
+    require_linux_obs_loopback,
     run_live_loop,
     validate_obs_backend,
+    warn_if_capture_source_is_loopback,
 )
 from corridorkey.runtime import RuntimePaths, load_model
 from corridorkey.video_io import none_path
@@ -307,12 +309,12 @@ def main(argv: list[str] | None = None) -> int:
         if backend == "pyvirtualcam" and not pyvirtualcam_available():
             raise RuntimeError(
                 "pip install pyvirtualcam  # required for --obs on Windows and Linux")
+        # Fail before the heavy CUDA model load when Linux has no loopback.
+        loopback = require_linux_obs_loopback(backend=backend)
+        if loopback and v4l2_device is None and backend == "pyvirtualcam":
+            v4l2_device = loopback
 
-    paths = RuntimePaths.from_package(package_root, args.weights)
-    print("Loading model for live path (CUDA: foundations + stage1 + stage2)...")
-    model = load_model(paths, device="cuda")
-
-    # Probe size for hint / meta
+    # Probe size for hint / meta (before model load so bad --source fails fast)
     if use_desktop:
         from corridorkey.desktop_capture import DesktopCapture
         probe_cap = DesktopCapture(monitor=monitor)
@@ -320,12 +322,17 @@ def main(argv: list[str] | None = None) -> int:
         probe_cap.close()
         source: str | int | None = None
     else:
+        warn_if_capture_source_is_loopback(args.source)
         source = parse_capture_source(args.source)
         cap = open_capture(source)
         ok, probe = cap.read()
         cap.release()
         if not ok or probe is None:
             raise RuntimeError(f"Could not read a probe frame from {args.source!r}")
+
+    paths = RuntimePaths.from_package(package_root, args.weights)
+    print("Loading model for live path (CUDA: foundations + stage1 + stage2)...")
+    model = load_model(paths, device="cuda")
 
     h, w = probe.shape[:2]
     fps = args.target_fps if args.target_fps > 0 else 30.0

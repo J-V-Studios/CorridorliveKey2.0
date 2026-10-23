@@ -28,6 +28,8 @@ def main() -> int:
         parse_capture_source,
         require_cuda_gpu,
         validate_obs_backend,
+        v4l2_path_for_capture_source,
+        warn_if_capture_source_is_loopback,
     )
     from live_stream import (
         _parse_rgb,
@@ -133,6 +135,18 @@ def main() -> int:
     solid = load_background_bgr(
         "plate.png_does_not_exist", (32, 48), (0.1, 0.2, 0.3))
     assert solid.shape == (32, 48, 3)
+
+    # Capture source → V4L2 path mapping (Linux helpers; None on other OSes).
+    mapped = v4l2_path_for_capture_source(10)
+    if sys.platform.startswith("linux"):
+        assert mapped == "/dev/video10"
+        assert v4l2_path_for_capture_source("/dev/video2") == "/dev/video2"
+        # Warning must not raise even when no loopback is present.
+        warn_if_capture_source_is_loopback(10)
+    else:
+        assert mapped is None
+
+    assert "Arch:" in obs_setup_instructions(backend="pyvirtualcam")
 
     print("live helpers ok")
     return 0
