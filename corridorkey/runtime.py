@@ -602,16 +602,25 @@ def _linear_adjust_inverse_torch(linear: torch.Tensor, meta: dict) -> torch.Tens
 
 
 def _despill_average_srgb_torch(fg: torch.Tensor, strength: float = 0.5) -> torch.Tensor:
+    """Despill on RGB only; if ``fg`` has an alpha channel it is preserved."""
     if strength <= 0.0:
         return fg
-    r = fg[:, 0:1]
-    g = fg[:, 1:2]
-    b = fg[:, 2:3]
+    if fg.shape[1] < 3:
+        raise ValueError(f"despill expects at least 3 channels; got {tuple(fg.shape)}")
+    rgb = fg[:, :3]
+    alpha = fg[:, 3:4] if fg.shape[1] >= 4 else None
+    r = rgb[:, 0:1]
+    g = rgb[:, 1:2]
+    b = rgb[:, 2:3]
     spill = (g - (r + b) * 0.5).clamp(min=0.0)
     full = torch.cat([r + spill * 0.5, g - spill, b + spill * 0.5], dim=1)
     if strength >= 1.0:
-        return full
-    return fg * (1.0 - strength) + full * strength
+        out_rgb = full
+    else:
+        out_rgb = rgb * (1.0 - strength) + full * strength
+    if alpha is None:
+        return out_rgb
+    return torch.cat([out_rgb, alpha], dim=1)
 
 
 def _srgb_to_bgr_uint16_cpu(x: torch.Tensor) -> np.ndarray:

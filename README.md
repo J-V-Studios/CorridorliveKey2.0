@@ -90,6 +90,162 @@ writes:
 Native resolution is always preserved. The model reflect-pads internally to its
 required shape quantum and crops back to the original size for output.
 
+## Live Streaming (Real-Time) → OBS (Windows + Linux)
+
+Offline `infer.py` is built for clips. For live streamers, use the **GPU-only**
+per-frame path and feed OBS a **virtual camera**.
+
+**Keying always requires an NVIDIA CUDA GPU** on both Windows and Linux (same
+stack as offline inference). There is no CPU-only primary keying path —
+`live_stream.py` and `LiveKeySession` refuse to start without CUDA.
+
+### Desktop greenscreen → OBS (green window becomes transparent)
+
+Capture your monitor, GPU-key with CorridorKey, and force chroma-green pixels
+to alpha=0 so a green window/region on the desktop becomes see-through in the
+output.
+
+```
+pip install mss pyvirtualcam
+# Linux also: sudo bash scripts/setup_obs_vcam_linux.sh
+
+python live_stream.py --desktop --obs --transparent --preview
+# pick a display:  --monitor 1   (0=all, 1=first, 2=second, …)
+# aliases:         --source desktop   /   --source monitor:1
+```
+
+**How transparency works in OBS**
+
+| Platform | Virtual cam | What OBS sees |
+|---|---|---|
+| **Windows** | pyvirtualcam **BGRA** | Real per-pixel alpha — green/keyed areas are transparent in the Video Capture Device source |
+| **Linux** | pyvirtualcam / v4l2 | Often **RGB-only** — cutout is composited on black; preview shows a checker. Prefer Windows for true alpha, or place the source over your scene and accept black as “clear” / use a filter if needed |
+
+UX: open a solid-green window (or green region) on the captured display → it
+keys out. Press `q` in the preview to quit.
+
+### Recommended webcam UX: `--obs` + pyvirtualcam
+
+```
+pip install pyvirtualcam
+# solid dark background (no plate file needed):
+python live_stream.py --obs --source 0 --preview
+# or composite over your own image:
+python live_stream.py --obs --source 0 --background /path/to/your_plate.png --preview
+```
+
+CorridorKey keys/composites on the GPU, then publishes the result as a virtual
+webcam. With an opaque plate you usually **do not** need an OBS Chroma Key
+filter. With `--transparent`, prefer BGRA on Windows (see table above).
+`--background plate.png` in older examples was a **placeholder path** — use a
+real image file, or omit `--background` for the default solid color.
+
+Check readiness (no model load):
+
+```
+python live_stream.py --check-obs
+```
+
+Webcam-free sample (still needs CUDA + weights):
+
+```
+python live_stream.py --demo --preview
+# optional OBS:  python live_stream.py --demo --obs --preview
+# assets:       python scripts/download_demo_assets.py
+```
+
+Useful knobs:
+
+```
+python live_stream.py --obs --source 0 --preview --mirror --model-scale 0.5
+python live_stream.py --obs --source 0 --background ~/Pictures/office.png --preview
+```
+
+### Windows OBS setup
+
+1. Install CorridorKey deps (CUDA PyTorch, `ffmpeg` on PATH, weights via
+   `python scripts/download_weights.py`) and `pip install pyvirtualcam mss`.
+2. First virtual-cam run may install a driver — approve UAC if prompted.
+3. Start the keyer (webcam **or** desktop greenscreen):
+   ```
+   python live_stream.py --obs --source 0 --preview
+   python live_stream.py --desktop --obs --transparent --preview
+   ```
+4. In OBS: **Sources → + → Video Capture Device**.
+5. **Device:** select the virtual camera (often **OBS Virtual Camera**, or the
+   name printed by `live_stream`). With `--transparent`, Windows BGRA carries
+   real alpha — green/keyed pixels are see-through.
+6. Resolution/FPS: match your capture, or Automatic.
+7. Optional: right-click source → **Transform → Fit to Screen**; set canvas to
+   1920×1080 (or your stream size).
+8. Usually **do not** add an OBS Chroma Key filter when using `--transparent`
+   on Windows (alpha is already in the feed).
+
+### Linux OBS setup
+
+1. Same CorridorKey + CUDA setup as Windows, plus:
+   ```
+   pip install pyvirtualcam mss
+   sudo apt install v4l2loopback-dkms v4l2loopback-utils   # Debian/Ubuntu
+   # Fedora: sudo dnf install v4l2loopback
+   # Arch:   sudo pacman -S v4l2loopback-dkms
+   sudo bash scripts/setup_obs_vcam_linux.sh   # /dev/video10 "CorridorKey"
+   ```
+   (`v4l2loopback` is a **Linux-only** dependency; pyvirtualcam uses it under
+   the hood on Linux. Windows does not need it. Desktop capture prefers X11 /
+   XWayland.)
+2. Start the keyer:
+   ```
+   python live_stream.py --obs --source 0 --preview
+   python live_stream.py --desktop --obs --transparent --preview
+   ```
+3. In OBS: **Sources → + → Video Capture Device (V4L2)** (some builds omit
+   the “V4L2” suffix).
+4. **Device:** select **CorridorKey**, the pyvirtualcam node, or `/dev/video10`.
+5. Resolution/FPS: match your capture, or Automatic; fit to screen as needed.
+6. Linux virt cams are often **opaque RGB** — transparent cutouts appear over
+   black. Use the preview checker to verify the key; for true per-pixel alpha,
+   Windows BGRA is more reliable today.
+
+#### Linux-only alternative (no pyvirtualcam)
+
+```
+python live_stream.py --obs --obs-backend v4l2 --v4l2-device /dev/video10
+```
+
+This writes frames with ffmpeg → v4l2loopback. It is **not** available on
+Windows (`--obs-backend v4l2` is platform-gated).
+
+### Pipeline
+
+| Stage | How |
+|---|---|
+| Capture | webcam (`--source 0`), **desktop** (`--desktop` / `--monitor N`, needs `mss`), file/URL, or `--demo` |
+| Key | `LiveKeySession` on **CUDA**; optional chroma-green→alpha (`--transparent` / desktop) |
+| Composite / cutout | plate / solid, or **transparent BGRA cutout** for OBS |
+| Output (OBS, default) | `--obs` → **pyvirtualcam** (BGRA when `--transparent` on Windows) |
+| Output (Linux optional) | `--obs-backend v4l2` → ffmpeg → v4l2loopback (opaque) |
+| Other sinks | `--preview`, `--ffmpeg-out` |
+
+**Deps:** `pip install mss pyvirtualcam` for desktop + OBS. Linux virt-cam also
+needs `v4l2loopback` (see setup script). Desktop capture uses **mss** (best on
+Windows and Linux/X11; pure Wayland may need XWayland).
+
+Press `q` in a preview window to quit. Programmatic use:
+
+```python
+from corridorkey.live import LiveConfig, LiveKeySession
+from corridorkey.runtime import RuntimePaths, load_model
+
+model = load_model(RuntimePaths.from_package("."), device="cuda")
+session = LiveKeySession(model, LiveConfig(mirror=True, model_scale=0.5))
+result = session.process_frame(frame_bgr)  # composite_u8 is what OBS should see
+```
+
+Known limits versus offline clip mode: no multi-frame Hann blending (weaker
+long-range temporal consistency), peak VRAM holds all stages at once, and
+sustained FPS depends on resolution / GPU / `--model-scale`.
+
 ## Choosing An Inference Mode
 
 CorridorKey can run with no hints, a single first-frame hint, or a full hint
