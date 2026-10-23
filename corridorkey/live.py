@@ -719,32 +719,43 @@ class VirtualCamSink:
                 "Linux-only alternative without pyvirtualcam: "
                 "--obs-backend v4l2"
             ) from exc
-        self.with_alpha = bool(with_alpha)
-        self._alpha_fallback_warned = False
-        fmt = (
-            pyvirtualcam.PixelFormat.BGRA if self.with_alpha
-            else pyvirtualcam.PixelFormat.BGR
-        )
+        # Many Linux pyvirtualcam builds only expose BGR (no BGRA/RGBA enum).
+        fmt_bgra = getattr(pyvirtualcam.PixelFormat, "BGRA", None)
+        fmt_rgba = getattr(pyvirtualcam.PixelFormat, "RGBA", None)
+        fmt_bgr = getattr(pyvirtualcam.PixelFormat, "BGR", None)
+        want_alpha = bool(with_alpha) and (fmt_bgra is not None or fmt_rgba is not None)
+        if with_alpha and not want_alpha:
+            print(
+                "  [note] This pyvirtualcam build has no BGRA/RGBA pixel format; "
+                "sending opaque BGR cutout-on-black (preview checker still shows "
+                "transparency). Upgrade pyvirtualcam or use Windows for BGRA alpha.",
+                flush=True,
+            )
+        self.with_alpha = want_alpha
+        if self.with_alpha:
+            fmt = fmt_bgra if fmt_bgra is not None else fmt_rgba
+        else:
+            fmt = fmt_bgr
         kwargs: dict[str, Any] = {
             "width": int(width),
             "height": int(height),
             "fps": float(fps),
-            "fmt": fmt,
         }
+        if fmt is not None:
+            kwargs["fmt"] = fmt
         if device and is_linux():
             kwargs["device"] = device
         try:
             self._cam = pyvirtualcam.Camera(**kwargs)
-        except (TypeError, RuntimeError, ValueError):
-            # Older pyvirtualcam / Linux v4l2 without BGRA — fall back to BGR.
+        except (TypeError, RuntimeError, ValueError, OSError):
+            # Retry without device pin / without alpha fmt.
             kwargs.pop("device", None)
-            if self.with_alpha:
-                kwargs["fmt"] = pyvirtualcam.PixelFormat.BGR
+            if self.with_alpha and fmt_bgr is not None:
+                kwargs["fmt"] = fmt_bgr
                 self.with_alpha = False
                 print(
-                    "  [note] Virtual cam has no BGRA alpha on this platform; "
-                    "sending opaque BGR cutout-on-black. On Windows, BGRA usually "
-                    "works. Linux OBS: use the preview checker or see README.",
+                    "  [note] Virtual cam rejected BGRA; falling back to BGR "
+                    "cutout-on-black.",
                     flush=True,
                 )
             try:

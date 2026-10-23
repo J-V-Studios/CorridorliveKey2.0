@@ -105,6 +105,29 @@ def main() -> int:
     # The old bug: fake[0:1] is still 4-channel
     assert fake[0:1].shape[1] == 4
 
+    # PixelFormat.BGRA may be missing — VirtualCamSink must not AttributeError.
+    class _PF:
+        BGR = "bgr"
+        # no BGRA
+    class _FakePVC:
+        PixelFormat = _PF
+        class Camera:
+            def __init__(self, **kwargs):
+                self.device = "(fake)"
+                self.width = kwargs["width"]
+                self.height = kwargs["height"]
+            def send(self, frame): pass
+            def sleep_until_next_frame(self): pass
+            def close(self): pass
+    sys.modules["pyvirtualcam"] = _FakePVC  # type: ignore
+    # Re-import after stubbing the module name used inside VirtualCamSink.
+    import importlib
+    import corridorkey.live as live_mod
+    importlib.reload(live_mod)
+    sink = live_mod.VirtualCamSink(64, 48, 30.0, with_alpha=True)
+    assert sink.with_alpha is False
+    sink.close()
+
     print("live helpers ok")
     return 0
 
